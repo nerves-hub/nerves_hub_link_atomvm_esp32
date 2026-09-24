@@ -100,7 +100,9 @@ opts(Extra) ->
             esp => nh_ota_fake_esp,
             http => nh_ota_fake_http,
             flash => nh_ota_fake_flash,
-            slot => ?SLOT
+            slot => ?SLOT,
+            %% Retries are real sleeps, and a test has no weak link to wait out.
+            retry_backoff => {1, 2}
         },
         Extra
     ).
@@ -193,7 +195,9 @@ a_refused_connection_is_an_error_not_a_crash_test() ->
     Result = nh_ota:apply_update(payload(body()), opts(#{})),
 
     cleanup(ok),
-    ?assertMatch({error, {connect_failed, _}}, Result).
+    %% Tried again, since a refused connection is often a moment's outage, and
+    %% reported once the retries are spent.
+    ?assertMatch({error, {download_failed, {connect_failed, _}}}, Result).
 
 a_non_200_response_is_refused_test() ->
     ok = nh_ota_fake_esp:start(),
@@ -235,3 +239,145 @@ revert_restores() ->
         <<"/dev/partition/by-name/main.avm">>,
         maps:get({atomvm, boot_path}, nh_ota_fake_esp:nvs())
     ).
+
+%% ------------------------------------------------------------ resuming
+
+%% A dropped connection picks up where it stopped. The second request asks for
+%% the rest, and what lands in flash is still exactly the archive.
+a_dropped_download_resumes_from_where_it_stopped_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body(), #{drops => [5000]}),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{})),
+    Written = nh_ota_fake_esp:written(),
+    Requests = nh_ota_fake_http:requests(),
+
+    cleanup(ok),
+    ?assertEqual({ok, ?SLOT}, Result),
+    ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))),
+    ?assertMatch([[], [{<<"Range">>, <<"bytes=5000-">>}]], Requests).
+
+%% A server may ignore `Range'. The whole archive comes back, and it has to be
+%% taken from the start: the digest so far covers bytes it is about to resend.
+a_server_that_ignores_range_is_taken_from_the_start_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body(), #{drops => [5000], ranges => false}),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{})),
+    Written = nh_ota_fake_esp:written(),
+    Erased = nh_ota_fake_esp:erased(),
+
+    cleanup(ok),
+    ?assertEqual({ok, ?SLOT}, Result),
+    ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))),
+    %% Erased again before the rewrite, since flash cannot be written twice.
+    ?assertEqual(2, length(Erased)).
+
+a_download_that_keeps_dropping_gives_up_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body(), #{drops => [100, 100, 100]}),
+    ok = nh_ota_fake_flash:expect(#{}),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{max_retries => 2})),
+    Nvs = nh_ota_fake_esp:nvs(),
+
+    cleanup(ok),
+    ?assertMatch({error, {download_failed, {incomplete, _, _}}}, Result),
+    ?assertEqual(undefined, maps:get({atomvm, boot_path}, Nvs, undefined)).
+
+a_server_error_is_tried_again_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body(), 503),
+    ok = nh_ota_fake_flash:expect(#{}),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{max_retries => 1})),
+    Requests = nh_ota_fake_http:requests(),
+
+    cleanup(ok),
+    ?assertEqual({error, {download_failed, {http_status, 503}}}, Result),
+    ?assertEqual(2, length(Requests)).
+
+each_attempt_is_announced_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body(), #{drops => [5000]}),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+
+    Self = self(),
+    {ok, _} = nh_ota:apply_update(
+        payload(body()), opts(#{started => fun() -> Self ! attempt_started end})
+    ),
+
+    cleanup(ok),
+    ?assertEqual(2, count(attempt_started)).
+
+count(Message) ->
+    receive
+        Message -> 1 + count(Message)
+    after 0 -> 0
+    end.
+
+%% ---------------------------------------------------------------- the trial
+
+trial_test_() ->
+    {foreach, fun() -> nh_ota_fake_esp:start() end, fun(_) -> nh_ota_fake_esp:stop() end, [
+        {"firmware not on trial counts nothing", fun no_trial/0},
+        {"each boot on trial is counted", fun boots_are_counted/0},
+        {"out of boots, the device reverts", fun out_of_boots_reverts/0},
+        {"a commit ends the trial and the revert", fun commit_ends_everything/0},
+        {"a new update starts the count again", fun arming_resets_the_count/0}
+    ]}.
+
+on_trial() ->
+    ok = nh_ota_fake_esp:nvs_set_binary(nerves_hub, pending_slot, ?SLOT),
+    ok = nh_ota_fake_esp:nvs_set_binary(nerves_hub, previous_slot, <<"main.avm">>).
+
+esp() -> #{esp => nh_ota_fake_esp}.
+
+no_trial() ->
+    ?assertEqual(none, nh_ota:begin_trial(3, esp())),
+    ?assertNot(nh_ota:reverted(esp())).
+
+boots_are_counted() ->
+    on_trial(),
+    ?assertEqual({trial, ?SLOT, 1}, nh_ota:begin_trial(3, esp())),
+    ?assertEqual({trial, ?SLOT, 2}, nh_ota:begin_trial(3, esp())),
+    ?assertEqual({trial, ?SLOT, 3}, nh_ota:begin_trial(3, esp())).
+
+out_of_boots_reverts() ->
+    on_trial(),
+    [{trial, _, _} = nh_ota:begin_trial(2, esp()) || _ <- [1, 2]],
+
+    ?assertEqual({reverted, <<"main.avm">>}, nh_ota:begin_trial(2, esp())),
+    Nvs = nh_ota_fake_esp:nvs(),
+    ?assertEqual(<<"/dev/partition/by-name/main.avm">>, maps:get({atomvm, boot_path}, Nvs)),
+    %% No longer on trial, and remembering why.
+    ?assertEqual(none, nh_ota:pending(esp())),
+    ?assert(nh_ota:reverted(esp())).
+
+commit_ends_everything() ->
+    on_trial(),
+    {trial, _, 1} = nh_ota:begin_trial(3, esp()),
+    ok = nh_ota_fake_esp:nvs_set_binary(nerves_hub, reverted, <<"1">>),
+
+    ok = nh_ota:commit(esp()),
+
+    ?assertEqual(none, nh_ota:begin_trial(3, esp())),
+    ?assertNot(nh_ota:reverted(esp())),
+    ?assertEqual(
+        undefined, maps:get({nerves_hub, boot_attempts}, nh_ota_fake_esp:nvs(), undefined)
+    ).
+
+arming_resets_the_count() ->
+    on_trial(),
+    {trial, _, 1} = nh_ota:begin_trial(3, esp()),
+    {trial, _, 2} = nh_ota:begin_trial(3, esp()),
+
+    ok = nh_ota_fake_http:serve(body()),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+    {ok, ?SLOT} = nh_ota:apply_update(payload(body()), opts(#{})),
+    nh_ota_fake_http:stop(),
+    nh_ota_fake_flash:stop(),
+
+    ?assertEqual({trial, ?SLOT, 1}, nh_ota:begin_trial(3, esp())).

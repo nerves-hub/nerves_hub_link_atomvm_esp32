@@ -16,12 +16,18 @@
 <h2><a name="description">Description</a></h2><p>The extensions channel: health, geo and logs.</p>
  
   <p>Extensions are optional capabilities a device offers and the platform turns
-  on. The device joins the <code>extensions</code> topic with what it can do and the  
-versions it speaks, and the join reply names the subset the platform wants  
-attached — a device may support an extension the product has switched off.</p>
+  on. After the device joins, NervesHub advertises the extensions it knows and
+  the versions of each it speaks, newest first. The device joins the
+  <code>extensions</code> topic with the ones it can do, one version each, and the join  
+reply names the subset the platform wants attached — a device may support an  
+extension the product has switched off.</p>
  
-  <pre>  join payload   #{&lt;&lt;"health"&gt;&gt; =&gt; &lt;&lt;"0.0.1"&gt;&gt;, ...}   device -&gt; server
-  join reply     [&lt;&lt;"health"&gt;&gt;, &lt;&lt;"geo"&gt;&gt;]             server -&gt; device</pre>
+  <pre>  extensions:get #{&lt;&lt;"extensions"&gt;&gt; =&gt; #{&lt;&lt;"logging"&gt;&gt; =&gt; [&lt;&lt;"0.1.0"&gt;&gt;, ..]}}  server -&gt; device
+  join payload   #{&lt;&lt;"logging"&gt;&gt; =&gt; &lt;&lt;"0.1.0"&gt;&gt;, ...}                         device -&gt; server
+  join reply     [&lt;&lt;"logging"&gt;&gt;, &lt;&lt;"geo"&gt;&gt;]                                   server -&gt; device</pre>
+ 
+  <p>A server that never advertises is an older one, and it is offered the oldest  
+version of each: the one every NervesHub that has extensions at all speaks.</p>
  
   <h3><a name="Scoped_events">Scoped events</a></h3>
  
@@ -29,6 +35,14 @@ attached — a device may support an extension the product has switched off.</p>
   <code>health:check</code> is <code>check</code> for <code>health</code>. Splitting on the first colon is the
   whole of the routing — the rest of the event name may contain colons of its
   own, as <code>geo:location:request</code> does.</p>
+ 
+  <h3><a name="Turning_them_on_and_off">Turning them on and off</a></h3>
+ 
+  <p>An operator can switch an extension on or off while the device is connected.
+  NervesHub sends <code>attach</code> or <code>detach</code> naming it, and the device answers
+  <code>&amp;lt;key&amp;gt;:attached</code> or <code>&amp;lt;key&amp;gt;:detached</code>. Asked to attach something it cannot
+  run, it answers <code>&amp;lt;key&amp;gt;:error</code>, which NervesHub records as a failure rather  
+than waiting for an answer that will never come.</p>
  
   <h3><a name="What_this_module_does_not_do">What this module does not do</a></h3>
  
@@ -38,18 +52,23 @@ attached — a device may support an extension the product has switched off.</p>
 <h2><a name="types">Data Types</a></h2>
 
 <h3 class="typedecl"><a name="type-state">state()</a></h3>
-<p><code>state() = #{enabled := [binary()], attached := [binary()]}</code></p>
+<p><code>state() = #{enabled := [binary()], offered := #{binary() =&gt; binary()}, attached := [binary()]}</code></p>
 
 
 <h2><a name="index">Function Index</a></h2>
 <table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#attach-2">attach/2</a></td><td>Record the attach list from the join reply, and confirm it.</td></tr>
 <tr><td valign="top"><a href="#attached-1">attached/1</a></td><td></td></tr>
-<tr><td valign="top"><a href="#available-1">available/1</a></td><td>The join payload: what this device offers, and at which version.</td></tr>
+<tr><td valign="top"><a href="#available-1">available/1</a></td><td>The join payload for a server that never advertised: the oldest version
+  of each extension.</td></tr>
+<tr><td valign="top"><a href="#detach-2">detach/2</a></td><td>Stop answering for an extension, without telling NervesHub.</td></tr>
+<tr><td valign="top"><a href="#disconnected-1">disconnected/1</a></td><td>The connection went away, and every extension with it.</td></tr>
 <tr><td valign="top"><a href="#enabled-1">enabled/1</a></td><td></td></tr>
 <tr><td valign="top"><a href="#handle_event-3">handle_event/3</a></td><td>Route an event to its extension.</td></tr>
 <tr><td valign="top"><a href="#is_attached-2">is_attached/2</a></td><td></td></tr>
 <tr><td valign="top"><a href="#new-1">new/1</a></td><td>Build the registry from configuration.</td></tr>
+<tr><td valign="top"><a href="#offer-2">offer/2</a></td><td>Choose what to join with, given what NervesHub advertised.</td></tr>
 <tr><td valign="top"><a href="#scope-1">scope/1</a></td><td>Split a scoped event into its extension and the event within it.</td></tr>
+<tr><td valign="top"><a href="#version-2">version/2</a></td><td>The version an extension was offered at, or <code>undefined</code>.</td></tr>
 </table>
 
 <h2><a name="functions">Function Details</a></h2>
@@ -61,7 +80,7 @@ attached — a device may support an extension the product has switched off.</p>
 </div><p><p>Record the attach list from the join reply, and confirm it.</p>
  
   <p>Anything the platform did not name stays detached, and anything named that  
-this device does not actually offer is ignored rather than trusted.</p>
+this device did not offer is ignored rather than trusted.</p>
  
   The confirmations are the point. NervesHub does not start an extension when
   it puts it in the attach list — it waits for the device to answer
@@ -80,7 +99,26 @@ this device does not actually offer is ignored rather than trusted.</p>
 <div class="spec">
 <p><code>available(X1::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; map()</code><br></p>
 <p> </p>
-</div><p>The join payload: what this device offers, and at which version.</p>
+</div><p>The join payload for a server that never advertised: the oldest version
+  of each extension.</p>
+
+<h3 class="function"><a name="detach-2">detach/2</a></h3>
+<div class="spec">
+<p><code>detach(Name::binary(), State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; <a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a></code><br></p>
+<p> </p>
+</div><p><p>Stop answering for an extension, without telling NervesHub.</p>
+ 
+  For when NervesHub has already said it does not know the extension — it
+  answers a push for one with <code>detach</code> — and so has nothing to be told.</p>
+
+<h3 class="function"><a name="disconnected-1">disconnected/1</a></h3>
+<div class="spec">
+<p><code>disconnected(State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; <a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a></code><br></p>
+<p> </p>
+</div><p><p>The connection went away, and every extension with it.</p>
+ 
+  What was enabled is kept; what was offered and attached is decided again on
+  the next join.</p>
 
 <h3 class="function"><a name="enabled-1">enabled/1</a></h3>
 <div class="spec">
@@ -94,10 +132,13 @@ this device does not actually offer is ignored rather than trusted.</p>
 <p> </p>
 </div><p><p>Route an event to its extension.</p>
  
-  Returns actions rather than performing them: <code>{push, ScopedEvent, Payload}</code>
-  to answer immediately, <code>{resolve_location}</code> for the one that needs the
-  network. An event for an extension that is not attached is dropped — the
-  platform asking for something it never turned on is not something to answer.</p>
+  <p>Returns actions rather than performing them: <code>{push, ScopedEvent, Payload}</code>
+  to answer immediately, <code>{resolve_location}</code> for the one that needs the  
+network. An event for an extension that is not attached is dropped — the  
+platform asking for something it never turned on is not something to answer.</p>
+ 
+  <code>attach</code> and <code>detach</code> are the two unscoped events, and switch extensions on
+  and off while connected.</p>
 
 <h3 class="function"><a name="is_attached-2">is_attached/2</a></h3>
 <div class="spec">
@@ -114,11 +155,28 @@ this device does not actually offer is ignored rather than trusted.</p>
   <code>extensions =&gt; [health, geo, logging]</code>, or <code>all</code>. Nothing is enabled by
   default: each one costs traffic a device may not want to spend.</p>
 
+<h3 class="function"><a name="offer-2">offer/2</a></h3>
+<div class="spec">
+<p><code>offer(NoAdvert::map() | undefined, State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; {<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>, map()}</code><br></p>
+<p> </p>
+</div><p><p>Choose what to join with, given what NervesHub advertised.</p>
+ 
+  <code>Advert</code> is the <code>extensions:get</code> payload, or <code>undefined</code> when none came. Of
+  each extension both ends know, the newest version both speak. One the server
+  did not advertise is left out: it would not attach it, and offering it would
+  only earn a reply saying so.</p>
+
 <h3 class="function"><a name="scope-1">scope/1</a></h3>
 <div class="spec">
 <p><code>scope(Scoped::binary()) -&gt; {binary(), binary()} | error</code><br></p>
 <p> </p>
 </div><p>Split a scoped event into its extension and the event within it.</p>
+
+<h3 class="function"><a name="version-2">version/2</a></h3>
+<div class="spec">
+<p><code>version(Name::binary(), X2::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; binary() | undefined</code><br></p>
+<p> </p>
+</div><p>The version an extension was offered at, or <code>undefined</code>.</p>
 <hr>
 
 <div class="navbar"><a name="#navbar_bottom"></a><table width="100%" border="0" cellspacing="0" cellpadding="2" summary="navigation bar"><tr><td><a href="overview-summary.html" target="overviewFrame">Overview</a></td><td><a href="http://www.erlang.org/"><img src="erlang.png" align="right" border="0" alt="erlang logo"></a></td></tr></table></div>

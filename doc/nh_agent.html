@@ -15,9 +15,11 @@
 
 <h2><a name="description">Description</a></h2><p>The device agent: socket, channel, heartbeat, and dispatch.</p>
  
-  <p>This is the only process. <code>nh_channel</code> holds the protocol and <code>nh_metadata</code>  
-reads the firmware description; both are pure, and this loop is what gives  
-them a socket and a clock.</p>
+  <p>This is the only long-lived process. <code>nh_channel</code> holds the protocol and
+  <code>nh_metadata</code> reads the firmware description; both are pure, and this loop  
+is what gives them a socket and a clock. Anything that blocks — a download,  
+a location lookup, a support script — runs in a process of its own and  
+reports back here.</p>
  
   <h3><a name="The_transport">The transport</a></h3>
  
@@ -34,21 +36,28 @@ this shape.</p>
  
   <h3><a name="Reconnection">Reconnection</a></h3>
  
-  <p>The transport reconnects on its own, so <code>connected</code> arrives more than once.
-  Every one of them starts a fresh channel join, because a Phoenix channel does
-  not survive a socket reconnect. This is the whole reason the agent watches for
-  <code>connected</code> rather than joining once at startup.</p>
+  <p>The agent reconnects, not the transport. A shared-secret signature is only  
+good for 90 seconds, and a transport that reconnects on its own replays the  
+headers it was opened with — so after the first minute and a half every  
+reconnect would be refused, and keep being refused, with the device looking  
+as though it were merely offline. So the transport is opened with its own  
+reconnection off, and when a connection is lost the agent closes it, waits a  
+backoff, and opens a new one with freshly signed headers.</p>
  
-  <h3><a name="Heartbeats">Heartbeats</a></h3>
+  <p>Every connection starts a fresh channel join, because a Phoenix channel does  
+not survive a socket reconnect.</p>
  
-  NervesHub closes a socket that stops sending heartbeats. The deadline is kept
-  as an absolute time rather than a <code>receive ... after</code> timeout, so a steady
-  stream of incoming messages cannot keep pushing the heartbeat out and get the
-  device disconnected while it looks busy and healthy.
+  <h3><a name="Timers">Timers</a></h3>
+ 
+  Everything this process waits for is kept as an absolute deadline in one
+  table, and the loop sleeps until the earliest. A <code>receive ... after</code> per
+  concern would not work: a steady stream of incoming messages would keep
+  pushing every timeout out, and a device would stop heartbeating while it
+  looked busy and healthy.
 <h2><a name="types">Data Types</a></h2>
 
 <h3 class="typedecl"><a name="type-config">config()</a></h3>
-<p><code>config() = #{url =&gt; binary() | string(), host =&gt; binary() | string(), identifier := binary(), transport =&gt; module(), shared_secret =&gt; {binary(), binary()}, client_cert =&gt; {binary(), binary()}, verify =&gt; term(), metadata =&gt; map(), handler =&gt; pid(), heartbeat_ms =&gt; pos_integer()}</code></p>
+<p><code>config() = #{url =&gt; binary() | string(), host =&gt; binary() | string(), identifier := binary(), transport =&gt; module(), shared_secret =&gt; {binary(), binary()}, client_cert =&gt; {binary(), binary()}, verify =&gt; term(), metadata =&gt; map(), handler =&gt; pid(), heartbeat_ms =&gt; pos_integer(), reconnect_backoff =&gt; {pos_integer(), pos_integer()}, network_interface =&gt; binary(), firmware_trial =&gt; #{boot_attempts =&gt; pos_integer(), join_timeout_ms =&gt; pos_integer()} | off, log_flush_ms =&gt; pos_integer(), log_buffer =&gt; pos_integer()}</code></p>
 
 
 <h2><a name="index">Function Index</a></h2>

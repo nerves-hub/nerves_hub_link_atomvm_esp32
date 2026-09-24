@@ -275,3 +275,38 @@ a_heartbeat_reply_is_not_a_join_test() ->
     {State1, Events} = nh_channel:handle_text(Frame, State0),
     ?assertMatch([{event, {reply, <<"ok">>, _}}], Events),
     ?assertNot(nh_channel:joined(<<"device">>, State1)).
+
+%% ------------------------------------------------------ joining on request
+
+a_manual_topic_waits_to_be_joined_test() ->
+    State0 = nh_channel:add_topic(
+        <<"extensions">>, #{}, #{auto_join => false}, nh_channel:new(params())
+    ),
+    {State1, Actions} = nh_channel:connected(State0),
+    ?assertEqual([<<"device">>], [T || {send, F} <- Actions, [_, _, T, _, _] <- [decode_frame(F)]]),
+
+    {_State2, [{send, Frame}]} = nh_channel:join(
+        <<"extensions">>, #{<<"health">> => <<"0.0.1">>}, State1
+    ),
+    ?assertMatch(
+        [_, _, <<"extensions">>, <<"phx_join">>, #{<<"health">> := <<"0.0.1">>}],
+        decode_frame(Frame)
+    ).
+
+%% A reply to a push names the push, so a caller can tell which one failed.
+a_reply_to_a_push_carries_its_ref_test() ->
+    {State0, _} = joined_channel(),
+    Ref = nh_channel:peek_ref(State0),
+    {State1, [{send, Push}]} = nh_channel:push(<<"health:report">>, #{}, State0),
+    [JoinRef, Ref, _, _, _] = decode_frame(Push),
+
+    {_State2, Actions} = nh_channel:handle_text(
+        reply_frame(JoinRef, Ref, <<"error">>, <<"detach">>), State1
+    ),
+    ?assertEqual([{event, {reply, <<"device">>, Ref, <<"error">>, <<"detach">>}}], Actions).
+
+set_params_changes_the_next_join_test() ->
+    State0 = nh_channel:set_params(<<"device">>, #{<<"a">> => 1}, nh_channel:new(params())),
+    ?assertEqual(#{<<"a">> => 1}, nh_channel:params(<<"device">>, State0)),
+    {_State1, [{send, Frame}]} = nh_channel:connected(State0),
+    ?assertMatch([_, _, _, _, #{<<"a">> := 1}], decode_frame(Frame)).

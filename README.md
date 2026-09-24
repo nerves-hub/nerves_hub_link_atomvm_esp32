@@ -140,10 +140,16 @@ The calling process receives `{nerves_hub, Event}`:
 | `{update_ready, Slot}` | Written and armed; reboot when convenient |
 | `{update_failed, Reason}` | Refused, or the write failed |
 | `{firmware_committed, Slot}` | The running update proved itself |
+| `{firmware_trial, Slot, Boot}` | Booted firmware that has not proved itself yet |
+| `{firmware_reverted, Slot}` | It did not; the device boots `Slot` next |
+| `{update_mode, Mode, Allowed}` | NervesHub reported the update mode |
+| `{update_rejected, Reason}` | NervesHub refused `request_update/1` |
 | `identify` | Blink something |
 | `reboot_requested` | Only with `reboot => manual` |
 | `console_joined` | Someone opened the console |
-| `{disconnected, Reason}` | The socket dropped; the transport reconnects |
+| `{extensions_attached, Names}` | Which extensions NervesHub turned on |
+| `{extension_detached, Name}` | NervesHub stopped one it does not know |
+| `{disconnected, Reason}` | The socket dropped; the agent reconnects |
 | `{transport_error, Reason}` | TLS or network failure |
 
 And reports back:
@@ -197,6 +203,11 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `register` | none | Register the agent under a name |
 | `handler` | the caller | Where `{nerves_hub, Event}` goes |
 | `heartbeat_ms` | 30000 | |
+| `reconnect_backoff` | `{1000, 60000}` | First and longest wait between reconnects, in ms |
+| `firmware_trial` | `#{boot_attempts => 3, join_timeout_ms => 300000}` | Or `off`. See [on trial](#on-trial) |
+| `network_interface` | `<<"wlan0">>` | What the device reports it connects over |
+| `log_flush_ms` | 10000 | How long batched log lines wait |
+| `log_buffer` | 100 | Log lines held before the oldest are dropped |
 | `transport` | `websocket_client` | |
 
 ## Updates
@@ -209,6 +220,63 @@ knows whether the device is in the middle of something.
 Writing to the inactive slot is what makes a failed update survivable: the
 running archive is never overwritten, so a refused or corrupt download leaves
 the device running what it had.
+
+NervesHub hears how it goes as it goes: `received` when the update is accepted,
+`started` as each download attempt begins, progress while it downloads,
+`completed` once it is armed, and `failed` with a reason if it is not.
+
+A download that drops part way is resumed from the last byte received, with a
+`Range` request, up to five more times with a growing pause between. Only a
+failure another attempt would not fix, such as a 404 or a flash write that
+failed, ends it at once. A download that goes two minutes without a byte is
+given up on, since the HTTP client has no timeout of its own.
+
+### Deciding for yourself
+
+`updates => manual` reports the offer as `{message, <<"update">>, Payload}` and
+waits. Answer it with one of:
+
+```erlang
+nerves_hub_link:apply_update(Pid, Payload),
+nerves_hub_link:ignore_update(Pid, <<"on battery">>),
+nerves_hub_link:reschedule_update(Pid, 3600000, <<"in use">>).
+```
+
+Ignoring holds further offers back for the deployment's penalty timeout, and
+rescheduling asks for the same offer again after the delay.
+
+### Device-managed updates
+
+A product can let its devices choose when to update. A device in
+`device_managed` mode gets no pushes, and asks instead:
+
+```erlang
+{ok, #{mode := device_managed}} = nerves_hub_link:set_update_mode(Pid, device_managed),
+{ok, #{available := true}} = nerves_hub_link:check_for_update(Pid),
+ok = nerves_hub_link:request_update(Pid).
+```
+
+`request_update/1` returns once NervesHub has sent the update and the download
+has begun, and the result arrives as `{update_ready, Slot}` or
+`{update_failed, Reason}` as for any other update. It installs even with
+`updates => manual`, since asking was the decision. NervesHub refuses with
+`{error, no_update}`, `{error, no_deployment_group}` and the like, and
+`set_update_mode/2` with `{error, not_permitted}` for a product that does not
+allow it. `update_mode/1` returns the mode NervesHub last reported without
+asking again.
+
+### On trial
+
+A new firmware is on trial until it reaches NervesHub. It has three boots to
+join, counted in NVS where a crash cannot reset the count, and five minutes on
+each. If it runs out of either, the device points back at the firmware it was
+running before and restarts into it. That firmware then tells NervesHub it is
+running because an update was reverted.
+
+The count is kept when `nerves_hub_link:start/1` runs, so a firmware that
+crashes before calling it at all is not caught. Start the agent early, before
+anything that could fail. `firmware_trial => off` turns all of this off;
+`reboot => manual` reverts but leaves the restart to the application.
 
 ### Where the slots come from
 
@@ -267,10 +335,37 @@ with a fixed set of commands instead: `help`, `info`, `firmware`, `memory`,
 It reports, and it reboots. It will not evaluate Erlang, and it is not a way in
 to a running system.
 
+## Support scripts
+
+NervesHub's support scripts, and the connecting code it runs on every join,
+are Elixir on Nerves. There is nothing to evaluate them with here, so a script
+is console commands, one per line:
+
+```
+# What is this device running?
+firmware
+memory
+```
+
+Blank lines and `#` lines are skipped, and the first line that is not a command
+fails the script, so one written for Nerves says it cannot run rather than
+reporting nothing. `reboot` is refused in a script: in connecting code it would
+restart the device every time it connected.
+
 ## Extensions
 
 `extensions => all` attaches the three NervesHub extensions: `health` reports
 memory and uptime, `geo` reports a location, and `logging` carries log lines.
+
+After the device joins, NervesHub says which versions of each it speaks and the
+device joins with the newest both know. An operator can turn one off or on
+while the device is connected, and it stops or starts answering.
+
+Logging speaks both formats. Against a NervesHub that has version 0.1.0, lines
+are held and sent in batches of up to 100, every `log_flush_ms` or as soon as a
+batch fills, which keeps a burst at boot inside NervesHub's rate limit. Lines
+logged while disconnected are held too, up to `log_buffer`, and the first batch
+after dropping any says how many went.
 
 `nh_logger` is a `logger` handler that sends everything logged, and
 `nerves_hub_link:send_log/3` sends one line directly.
@@ -352,6 +447,12 @@ healthy and silently stops receiving updates.
 | `atomvm_app_version` | its `vsn` |
 | `atomvm_avm_sha256` | SHA-256 of the packbeam |
 | `atomvm_version` | `erlang:system_info(atomvm_version)` |
+| `device_api_version` | `2.4.0`, the NervesHub protocol it speaks |
+| `meta.firmware_validated` | `false` while the firmware is [on trial](#on-trial) |
+| `meta.firmware_auto_revert_detected` | `true` after a revert, until the next update proves itself |
+
+After joining it also reports `report_network_interface`, from
+`network_interface`.
 
 So the device reports what is actually running rather than a constant it was
 compiled with. There is no UUID: NervesHub derives one from the digest using the
@@ -377,9 +478,17 @@ and keeping only the one entry it needs, so the archive is never held in memory.
 
 ## The agent
 
-`nh_agent` is the only process: it opens the socket, joins on every `connected`,
-heartbeats on a deadline, and surfaces messages to its owner as
-`{nerves_hub, Event}`.
+`nh_agent` is the only long-lived process: it opens the socket, joins on every
+`connected`, heartbeats on a deadline, and surfaces messages to its owner as
+`{nerves_hub, Event}`. Downloads, location lookups and scripts each run in a
+process of their own and report back to it.
+
+It reconnects rather than leaving that to the transport. A shared-secret
+signature is good for 90 seconds, and a transport that reconnects by itself
+replays the headers it was opened with, so every reconnect after the first
+minute and a half would be refused. The agent opens the transport with its own
+reconnection off, and when the connection drops it waits a backoff with jitter
+and opens a new one, signed at that moment.
 
 ```erlang
 {ok, _} = nh_agent:start(#{
@@ -413,6 +522,12 @@ is the one it uses on a device.
 | Remote console | ✅ a fixed set of commands, since AtomVM has no shell |
 | Health, geo and logging extensions | ✅ |
 | `identify` and `reboot` | ✅ |
+| Reconnecting with fresh signatures | tested against fakes only |
+| Resuming a dropped download | tested against fakes only |
+| Reverting firmware that does not join | tested against fakes only |
+| Support scripts | tested against fakes only |
+| Device-managed updates | tested against fakes only |
+| Extension negotiation and batched logging | tested against fakes only |
 | Capturing `io:format` and `IO.puts` | ✅ |
 | Client certificates | accepted in config, never run on a device |
 

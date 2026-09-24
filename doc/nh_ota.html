@@ -34,9 +34,23 @@ back, so a download that was corrupted in flight is caught. The archive is
 then read back from flash and walked, which catches a write that did not  
 land. Only after both does the boot path move.</p>
  
-  Order matters: until the boot path is written the device still boots what it
-  was running, so a failure at any earlier point costs nothing but the
-  download.
+  <p>Order matters: until the boot path is written the device still boots what it  
+was running, so a failure at any earlier point costs nothing but the  
+download.</p>
+ 
+  <h3><a name="When_the_connection_drops">When the connection drops</a></h3>
+ 
+  <p>A download that fails part way is tried again, resuming from the last byte
+  received with a <code>Range</code> request, a few times with a growing pause between.
+  Only a failure another attempt would not fix — a 404, a flash write that
+  failed — ends it at once. A server that answers a <code>Range</code> request with the  
+whole archive gets it taken from the start, after erasing again.</p>
+ 
+  <h3><a name="On_trial">On trial</a></h3>
+ 
+  Arming an update puts it on trial. <code>begin_trial/1</code> counts each boot of it,
+  <code>commit/0</code> ends the trial once it has proved itself, and <code>revert/0</code> points
+  the device back at what it ran before. <code>nh_agent</code> drives all three.
 <h2><a name="types">Data Types</a></h2>
 
 <h3 class="typedecl"><a name="type-update_result">update_result()</a></h3>
@@ -49,6 +63,9 @@ land. Only after both does the boot path move.</p>
 <tr><td valign="top"><a href="#apply_update-2">apply_update/2</a></td><td>Download and install an update, returning the slot it was written to.</td></tr>
 <tr><td valign="top"><a href="#available-0">available/0</a></td><td>Whether this platform can write flash at all.</td></tr>
 <tr><td valign="top"><a href="#available-1">available/1</a></td><td>As <code>available/0</code>, against a given <code>esp</code> module.</td></tr>
+<tr><td valign="top"><a href="#begin_trial-1">begin_trial/1</a></td><td>Equivalent to <a href="#begin_trial-2" docgen-rel="seemfa" docgen-href="#begin_trial/2"><code>begin_trial(MaxAttempts, #{})</code></a>.
+</td></tr>
+<tr><td valign="top"><a href="#begin_trial-2">begin_trial/2</a></td><td>Count this boot against firmware that is on trial.</td></tr>
 <tr><td valign="top"><a href="#commit-0">commit/0</a></td><td>Accept the running firmware, so it is no longer on trial.</td></tr>
 <tr><td valign="top"><a href="#commit-1">commit/1</a></td><td>As <code>commit/0</code>, against a given <code>esp</code> module.</td></tr>
 <tr><td valign="top"><a href="#digest_matches-2">digest_matches/2</a></td><td>Compare a computed digest against the one NervesHub sent.</td></tr>
@@ -57,6 +74,8 @@ land. Only after both does the boot path move.</p>
 <tr><td valign="top"><a href="#pending-1">pending/1</a></td><td>As <code>pending/0</code>, against a given <code>esp</code> module.</td></tr>
 <tr><td valign="top"><a href="#revert-0">revert/0</a></td><td>Point the boot path back at the firmware that was running before.</td></tr>
 <tr><td valign="top"><a href="#revert-1">revert/1</a></td><td>As <code>revert/0</code>, against a given <code>esp</code> module.</td></tr>
+<tr><td valign="top"><a href="#reverted-0">reverted/0</a></td><td>Whether this device is running firmware it reverted to.</td></tr>
+<tr><td valign="top"><a href="#reverted-1">reverted/1</a></td><td></td></tr>
 <tr><td valign="top"><a href="#start_update-2">start_update/2</a></td><td>Run an update in its own process, reporting back to the caller.</td></tr>
 <tr><td valign="top"><a href="#start_update-3">start_update/3</a></td><td>As <code>start_update/2</code>, with options for <code>apply_update/2</code>.</td></tr>
 </table>
@@ -76,9 +95,19 @@ land. Only after both does the boot path move.</p>
 <p> </p>
 </div><p><p>Download and install an update, returning the slot it was written to.</p>
  
-  <code>Payload</code> is what NervesHub sends: <code>firmware_url</code>, <code>size</code> and <code>checksum</code>.
-  <code>Opts</code> may carry a <code>progress</code> function of one argument, called with a
-  percentage as the download proceeds, and a <code>slot</code> to override the target.</p>
+  <p><code>Payload</code> is what NervesHub sends: <code>firmware_url</code>, <code>size</code> and <code>checksum</code>.
+  <code>Opts</code> may carry:</p>
+ 
+  <ul>
+    <li><code>progress</code>, a function of one argument, called with a percentage as
+        the download proceeds</li>
+    <li><code>started</code>, a function of none, called as each attempt begins</li>
+    <li><code>slot</code>, to override the target</li>
+    <li><code>max_retries</code>, how many times to try again after the first attempt
+        fails, 5 by default</li>
+    <li><code>retry_backoff</code>, <code>{FirstMs, MaxMs}</code> between attempts, <code>{2000, 30000}</code>
+        by default</li>
+  </ul></p>
 
 <h3 class="function"><a name="available-0">available/0</a></h3>
 <div class="spec">
@@ -91,6 +120,32 @@ land. Only after both does the boot path move.</p>
 <p><code>available(Opts::map()) -&gt; boolean()</code><br></p>
 <p> </p>
 </div><p>As <code>available/0</code>, against a given <code>esp</code> module.</p>
+
+<h3 class="function"><a name="begin_trial-1">begin_trial/1</a></h3>
+<div class="spec">
+<p><code>begin_trial(MaxAttempts::pos_integer()) -&gt; none | {trial, binary(), pos_integer()} | {reverted, binary()}</code><br></p>
+<p> </p>
+</div><p>Equivalent to <a href="#begin_trial-2" docgen-rel="seemfa" docgen-href="#begin_trial/2"><code>begin_trial(MaxAttempts, #{})</code></a>.</p>
+
+
+<h3 class="function"><a name="begin_trial-2">begin_trial/2</a></h3>
+<div class="spec">
+<p><code>begin_trial(MaxAttempts::pos_integer(), Opts::map()) -&gt; none | {trial, binary(), pos_integer()} | {reverted, binary()}</code><br></p>
+<p> </p>
+</div><p><p>Count this boot against firmware that is on trial.</p>
+ 
+  <p>Called once per boot, before anything that could fail. A firmware on trial
+  gets <code>MaxAttempts</code> boots to reach NervesHub; one that has used them all is  
+reverted here, and the caller should restart the device into what it was  
+running before.</p>
+ 
+  <p>Counting boots rather than trusting a timer is what catches the firmware  
+that crashes before any timer could fire: each crash is a boot, and the  
+count is in NVS where the crash cannot take it.</p>
+ 
+  Returns <code>none</code> for firmware that is not on trial, <code>{trial, Slot, Attempt}</code>
+  for one that has boots left, and <code>{reverted, Previous}</code> for one that had
+  none.</p>
 
 <h3 class="function"><a name="commit-0">commit/0</a></h3>
 <div class="spec">
@@ -157,6 +212,20 @@ land. Only after both does the boot path move.</p>
 <p> </p>
 </div><p>As <code>revert/0</code>, against a given <code>esp</code> module.</p>
 
+<h3 class="function"><a name="reverted-0">reverted/0</a></h3>
+<div class="spec">
+<p><code>reverted() -&gt; boolean()</code><br></p>
+<p> </p>
+</div><p><p>Whether this device is running firmware it reverted to.</p>
+ 
+  True from a revert until the next update proves itself.</p>
+
+<h3 class="function"><a name="reverted-1">reverted/1</a></h3>
+<div class="spec">
+<p><code>reverted(Opts::map()) -&gt; boolean()</code><br></p>
+<p> </p>
+</div>
+
 <h3 class="function"><a name="start_update-2">start_update/2</a></h3>
 <div class="spec">
 <p><code>start_update(Payload::map(), Owner::pid()) -&gt; pid()</code><br></p>
@@ -165,7 +234,8 @@ land. Only after both does the boot path move.</p>
  
   The download takes as long as it takes, and the agent has heartbeats to send
   while it runs — so it does not run on the agent's process. The caller
-  receives <code>{nh_ota, self(), {progress, Percent}}</code> as it goes and
+  receives <code>{nh_ota, self(), started}</code> each time a download attempt begins,
+  <code>{nh_ota, self(), {progress, Percent}}</code> as it goes and
   <code>{nh_ota, self(), Result}</code> at the end.</p>
 
 <h3 class="function"><a name="start_update-3">start_update/3</a></h3>

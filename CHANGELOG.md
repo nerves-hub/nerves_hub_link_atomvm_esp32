@@ -5,6 +5,39 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A device authenticating with a shared secret could not reconnect once its
+  first connection was more than 90 seconds old. The transport reconnected by
+  itself and replayed the headers it was opened with, and NervesHub refuses a
+  signature that old, so a Wi-Fi drop, a server deploy or the Reconnect button
+  left the device refused until it rebooted. The agent now reconnects itself,
+  with backoff and jitter, and signs each connection as it opens it.
+
+### Added
+
+- `device_api_version` 2.4.0 in the join, which is what NervesHub gates support
+  scripts, extension negotiation and device-managed updates on. Before this it
+  treated every device as 1.0.0.
+- Support scripts: `scripts/run` runs console commands, one per line, and
+  answers with their output. `reboot` is refused in a script.
+- The full set of update statuses: `received`, `started` with the network
+  interface, `completed`, `ignored` and `rescheduled` alongside `failed`.
+- `apply_update/2`, `ignore_update/2` and `reschedule_update/3`, for an
+  application running with `updates => manual`.
+- Device-managed updates: `check_for_update/1`, `request_update/1`,
+  `set_update_mode/2` and `update_mode/1`.
+- Downloads resume from the last byte received after a dropped connection,
+  retried with backoff, and a download that goes quiet is given up on.
+- Firmware on trial is reverted if it does not join NervesHub within three
+  boots or five minutes of one, and the join reports `firmware_validated` and
+  `firmware_auto_revert_detected`. See `firmware_trial`.
+- `report_network_interface` after every join. See `network_interface`.
+- Extensions negotiate versions from NervesHub's `extensions:get`, and follow
+  an operator turning one on or off while connected.
+- Logging 0.1.0: lines are batched, held across a disconnect up to
+  `log_buffer`, and a gap from dropped lines is reported.
+
 ## [0.1.2] - 2026-08-24
 
 ### Fixed

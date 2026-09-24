@@ -44,7 +44,8 @@
 -module(nh_channel).
 
 -export([new/1, connected/1, disconnected/1, handle_text/2, heartbeat/1, joined/1]).
--export([add_topic/3, push/3, push/4, joined/2, topics/1]).
+-export([add_topic/3, add_topic/4, join/3, push/3, push/4, joined/2, topics/1, peek_ref/1]).
+-export([params/2, set_params/3]).
 
 -export_type([state/0, action/0]).
 
@@ -52,11 +53,13 @@
 -define(PHOENIX_TOPIC, <<"phoenix">>).
 
 %% Per topic: the join payload this channel reports, the reference its join was
-%% sent with, and whether the server has acknowledged it.
+%% sent with, whether the server has acknowledged it, and whether `connected/1'
+%% joins it or leaves that to the caller.
 -type topic_state() :: #{
     params := map(),
     join_ref := binary() | undefined,
-    joined := boolean()
+    joined := boolean(),
+    auto_join := boolean()
 }.
 
 %% One socket carrying several channels, in the order they were added, so the
@@ -83,7 +86,10 @@ new(Params) ->
     #{ref => 1, topics => [{?DEVICE_TOPIC, topic_state(Params)}]}.
 
 topic_state(Params) ->
-    #{params => Params, join_ref => undefined, joined => false}.
+    topic_state(Params, true).
+
+topic_state(Params, AutoJoin) ->
+    #{params => Params, join_ref => undefined, joined => false, auto_join => AutoJoin}.
 
 %%-----------------------------------------------------------------------------
 %% @doc Register another topic to join on this socket.
@@ -99,10 +105,67 @@ topic_state(Params) ->
 %% @end
 %%-----------------------------------------------------------------------------
 -spec add_topic(binary(), map(), state()) -> state().
-add_topic(Topic, Params, #{topics := Topics} = State) ->
+add_topic(Topic, Params, State) ->
+    add_topic(Topic, Params, #{}, State).
+
+%%-----------------------------------------------------------------------------
+%% @doc As `add_topic/3', with options.
+%%
+%% `auto_join => false' registers a topic that `connected/1' leaves alone, for
+%% one whose join has to wait for the server. The extensions topic is the case:
+%% what it joins with depends on what NervesHub advertises after the device
+%% join, so it is joined with `join/3' once that arrives.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec add_topic(binary(), map(), map(), state()) -> state().
+add_topic(Topic, Params, Opts, #{topics := Topics} = State) ->
+    AutoJoin = maps:get(auto_join, Opts, true),
     case lists:keyfind(Topic, 1, Topics) of
-        false -> State#{topics => Topics ++ [{Topic, topic_state(Params)}]};
+        false -> State#{topics => Topics ++ [{Topic, topic_state(Params, AutoJoin)}]};
         _Existing -> State
+    end.
+
+%%-----------------------------------------------------------------------------
+%% @doc Join a registered topic now, with these parameters.
+%%
+%% The parameters are kept, so a later `connected/1' that does join the topic
+%% joins it with what it last joined with.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec join(binary(), map(), state()) -> {state(), [action()]}.
+join(Topic, Params, State0) ->
+    case get_topic(Topic, State0) of
+        undefined ->
+            {State0, [{event, {unknown_topic, Topic, <<"phx_join">>}}]};
+        TS ->
+            State1 = put_topic(Topic, TS#{params => Params}, State0),
+            join_topic(Topic, {State1, []})
+    end.
+
+%%-----------------------------------------------------------------------------
+%% @doc The parameters a topic joins with, or `undefined' for an unknown topic.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec params(binary(), state()) -> map() | undefined.
+params(Topic, State) ->
+    case get_topic(Topic, State) of
+        undefined -> undefined;
+        #{params := Params} -> Params
+    end.
+
+%%-----------------------------------------------------------------------------
+%% @doc Replace what a topic joins with next time, without joining it now.
+%%
+%% For what changes while connected and has to be right on the next join: a
+%% firmware that validated after joining, say, must not rejoin claiming it has
+%% not.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec set_params(binary(), map(), state()) -> state().
+set_params(Topic, Params, State) ->
+    case get_topic(Topic, State) of
+        undefined -> State;
+        TS -> put_topic(Topic, TS#{params => Params}, State)
     end.
 
 %%-----------------------------------------------------------------------------
@@ -118,8 +181,9 @@ topics(#{topics := Topics}) ->
 %% @end
 %%-----------------------------------------------------------------------------
 -spec connected(state()) -> {state(), [action()]}.
-connected(State0) ->
-    lists:foldl(fun join_topic/2, {State0, []}, topics(State0)).
+connected(#{topics := Topics} = State0) ->
+    AutoJoined = [Topic || {Topic, #{auto_join := true}} <- Topics],
+    lists:foldl(fun join_topic/2, {State0, []}, AutoJoined).
 
 join_topic(Topic, {State0, Actions}) ->
     {Ref, State1} = next_ref(State0),
@@ -189,6 +253,17 @@ push(Topic, Event, Payload, State0) ->
     end.
 
 %%-----------------------------------------------------------------------------
+%% @doc The reference the next frame will carry.
+%%
+%% For a caller that needs to recognise the reply to a push: read it, push, and
+%% the `{reply, Topic, Ref, Status, Response}' event that answers carries it.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec peek_ref(state()) -> binary().
+peek_ref(#{ref := Ref}) ->
+    integer_to_binary(Ref).
+
+%%-----------------------------------------------------------------------------
 %% @doc Whether the join has been acknowledged.
 %% @end
 %%-----------------------------------------------------------------------------
@@ -209,7 +284,7 @@ joined(Topic, State) ->
 
 %% ------------------------------------------------------------------- internals
 
-dispatch(JoinRef, _Ref, Topic, <<"phx_reply">>, Payload, State) ->
+dispatch(JoinRef, Ref, Topic, <<"phx_reply">>, Payload, State) ->
     Status = map_get_default(<<"status">>, Payload, <<"error">>),
     Response = map_get_default(<<"response">>, Payload, #{}),
 
@@ -219,15 +294,19 @@ dispatch(JoinRef, _Ref, Topic, <<"phx_reply">>, Payload, State) ->
         undefined ->
             {State, [{event, {reply, Status, Response}}]};
         #{joined := Joined, join_ref := TopicJoinRef} = TS ->
-            IsJoinReply = JoinRef =/= null andalso JoinRef =:= TopicJoinRef,
+            CurrentJoin = JoinRef =/= null andalso JoinRef =:= TopicJoinRef,
 
-            case {IsJoinReply, Joined, Status} of
+            case {CurrentJoin, Joined, Status} of
                 {true, false, <<"ok">>} ->
                     {put_topic(Topic, TS#{joined => true}, State), [
                         {event, {joined, Topic, Response}}
                     ]};
                 {true, false, _} ->
                     {State, [{event, {join_error, Topic, Response}}]};
+                {true, true, _} ->
+                    %% A reply to something pushed during this join, which
+                    %% names the push it answers.
+                    {State, [{event, {reply, Topic, Ref, Status, Response}}]};
                 _ ->
                     {State, [{event, {reply, Status, Response}}]}
             end
