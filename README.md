@@ -105,7 +105,7 @@ each line.
 
 ```erlang
 {deps, [
-    {nerves_hub_link_atomvm_esp32, "~> 0.1"},
+    {nerves_hub_link_atomvm_esp32, "~> 0.2"},
     {atomvm_websocket_client,
         {git, "https://github.com/nerves-hub/atomvm_websocket_client.git",
             {branch, "main"}}}

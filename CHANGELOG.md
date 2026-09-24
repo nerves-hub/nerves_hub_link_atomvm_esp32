@@ -5,6 +5,32 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-24
+
+Upgrading changes what a device does by default. **Changed** lists what to
+check before rolling this out to a fleet.
+
+### Changed
+
+- Firmware is on trial after an update, and on by default. An update that does
+  not reach NervesHub within three boots, or within five minutes of any one of
+  them, is reverted and the device restarts into what it ran before. Nothing
+  reverted before. `firmware_trial => off` keeps the old behaviour, and
+  `reboot => manual` reverts without restarting.
+- The agent reconnects, not the transport. It opens the transport with
+  `disable_auto_reconnect => true`, and a transport other than
+  `websocket_client` must honour that or it will reconnect twice.
+- New events reach the handler: `{update_mode, Mode, Allowed}` after every
+  join, and `{firmware_trial, Slot, Boot}`, `{firmware_reverted, Slot}`,
+  `{update_rejected, Reason}` and `{extension_detached, Name}` when they apply.
+  A `gen_server` handler without a catch-all `handle_info/2` clause crashes on
+  the first one it does not match.
+- The extensions topic is joined after the device topic rather than alongside
+  it: once NervesHub says which versions it speaks, or after five seconds.
+- Against a NervesHub that speaks logging 0.1.0, log lines are sent in batches
+  and arrive up to `log_flush_ms`, 10 seconds by default, after they were
+  logged.
+
 ### Fixed
 
 - A device authenticating with a shared secret could not reconnect once its
@@ -88,7 +114,8 @@ hardware against a running NervesHub rather than only against tests.
 - `priv/atomvm`, the partition table and build settings a device needs, so the
   VM is reproducible rather than described.
 
-[Unreleased]: https://github.com/nerves-hub/nerves_hub_link_atomvm_esp32/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/nerves-hub/nerves_hub_link_atomvm_esp32/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/nerves-hub/nerves_hub_link_atomvm_esp32/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/nerves-hub/nerves_hub_link_atomvm_esp32/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nerves-hub/nerves_hub_link_atomvm_esp32/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nerves-hub/nerves_hub_link_atomvm_esp32/releases/tag/v0.1.0
