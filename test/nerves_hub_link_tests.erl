@@ -185,7 +185,10 @@ explicit_none_is_allowed_test() ->
 
     Pid ! {websocket, fake_handle, connected},
     [_, _, _, <<"phx_join">>, Payload] = json:decode(next_sent()),
-    ?assertEqual(#{}, Payload),
+    %% No firmware described. What is left is what the agent says about itself.
+    ?assertEqual(
+        [<<"device_api_version">>, <<"meta">>], lists:sort(maps:keys(Payload))
+    ),
 
     nerves_hub_link:stop(Pid).
 
@@ -244,6 +247,7 @@ reports_progress_and_validation_test() ->
     ]),
     Pid ! {websocket, fake_handle, {text, iolist_to_binary(Reply)}},
     {nerves_hub, {joined, _}} = next(1000),
+    [_, _, <<"device">>, <<"report_network_interface">>, _] = json:decode(next_sent()),
 
     ok = nerves_hub_link:update_progress(Pid, 42, <<"downloading">>),
     [_, _, <<"device">>, <<"update_progress">>, Progress] = json:decode(next_sent()),

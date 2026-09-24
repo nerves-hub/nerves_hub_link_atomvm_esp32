@@ -1,6 +1,7 @@
 %% encoding: UTF-8
 {application,nerves_hub_link_atomvm_esp32}.
-{modules,[nerves_hub_link,nh_agent,nh_avm_sign,nh_channel,nh_console,
-          nh_console_h,nh_ext_geo,nh_ext_health,nh_ext_logs,nh_extensions,
-          nh_flash,nh_io_capture,nh_logger,nh_metadata,nh_ota,nh_packbeam,
-          nh_shared_secret,nh_signature,nh_slots,nh_url]}.
+{modules,[nerves_hub_link,nh_agent,nh_avm_sign,nh_backoff,nh_channel,
+          nh_console,nh_console_h,nh_ext_geo,nh_ext_health,nh_ext_logs,
+          nh_extensions,nh_flash,nh_io_capture,nh_log_buffer,nh_logger,
+          nh_metadata,nh_ota,nh_packbeam,nh_scripts,nh_shared_secret,
+          nh_signature,nh_slots,nh_url]}.

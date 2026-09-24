@@ -57,15 +57,20 @@ from a desktop, over any WebSocket client, before any of it runs on a device.</p
 
 <h2><a name="index">Function Index</a></h2>
 <table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#add_topic-3">add_topic/3</a></td><td>Register another topic to join on this socket.</td></tr>
+<tr><td valign="top"><a href="#add_topic-4">add_topic/4</a></td><td>As <code>add_topic/3</code>, with options.</td></tr>
 <tr><td valign="top"><a href="#connected-1">connected/1</a></td><td>Called on every connection, including reconnections.</td></tr>
 <tr><td valign="top"><a href="#disconnected-1">disconnected/1</a></td><td>The socket went away.</td></tr>
 <tr><td valign="top"><a href="#handle_text-2">handle_text/2</a></td><td>Handle a text frame from the socket.</td></tr>
 <tr><td valign="top"><a href="#heartbeat-1">heartbeat/1</a></td><td>A heartbeat frame.</td></tr>
+<tr><td valign="top"><a href="#join-3">join/3</a></td><td>Join a registered topic now, with these parameters.</td></tr>
 <tr><td valign="top"><a href="#joined-1">joined/1</a></td><td>Whether the join has been acknowledged.</td></tr>
 <tr><td valign="top"><a href="#joined-2">joined/2</a></td><td>Whether a named topic's join has been acknowledged.</td></tr>
 <tr><td valign="top"><a href="#new-1">new/1</a></td><td>A channel that has not connected yet.</td></tr>
+<tr><td valign="top"><a href="#params-2">params/2</a></td><td>The parameters a topic joins with, or <code>undefined</code> for an unknown topic.</td></tr>
+<tr><td valign="top"><a href="#peek_ref-1">peek_ref/1</a></td><td>The reference the next frame will carry.</td></tr>
 <tr><td valign="top"><a href="#push-3">push/3</a></td><td>Push an event to the device channel.</td></tr>
 <tr><td valign="top"><a href="#push-4">push/4</a></td><td>Push an event to a named topic.</td></tr>
+<tr><td valign="top"><a href="#set_params-3">set_params/3</a></td><td>Replace what a topic joins with next time, without joining it now.</td></tr>
 <tr><td valign="top"><a href="#topics-1">topics/1</a></td><td>Every topic registered, in join order.</td></tr>
 </table>
 
@@ -85,6 +90,17 @@ two different frames with the same reference.</p>
  
   Topics keep the order they were added, so the device topic is joined first
   and the rest follow.</p>
+
+<h3 class="function"><a name="add_topic-4">add_topic/4</a></h3>
+<div class="spec">
+<p><code>add_topic(Topic::binary(), Params::map(), Opts::map(), State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; <a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a></code><br></p>
+<p> </p>
+</div><p><p>As <code>add_topic/3</code>, with options.</p>
+ 
+  <code>auto_join =&gt; false</code> registers a topic that <code>connected/1</code> leaves alone, for
+  one whose join has to wait for the server. The extensions topic is the case:
+  what it joins with depends on what NervesHub advertises after the device
+  join, so it is joined with <code>join/3</code> once that arrives.</p>
 
 <h3 class="function"><a name="connected-1">connected/1</a></h3>
 <div class="spec">
@@ -114,6 +130,15 @@ two different frames with the same reference.</p>
 <p> </p>
 </div><p>A heartbeat frame. NervesHub closes a socket that stops sending these.</p>
 
+<h3 class="function"><a name="join-3">join/3</a></h3>
+<div class="spec">
+<p><code>join(Topic::binary(), Params::map(), State0::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; {<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>, [<a href="#type-action" docgen-rel="seetype" docgen-href="#action/0">action()</a>]}</code><br></p>
+<p> </p>
+</div><p><p>Join a registered topic now, with these parameters.</p>
+ 
+  The parameters are kept, so a later <code>connected/1</code> that does join the topic
+  joins it with what it last joined with.</p>
+
 <h3 class="function"><a name="joined-1">joined/1</a></h3>
 <div class="spec">
 <p><code>joined(State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; boolean()</code><br></p>
@@ -134,6 +159,21 @@ two different frames with the same reference.</p>
  
   <code>Params</code> is the join payload: what the device reports about itself.</p>
 
+<h3 class="function"><a name="params-2">params/2</a></h3>
+<div class="spec">
+<p><code>params(Topic::binary(), State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; map() | undefined</code><br></p>
+<p> </p>
+</div><p>The parameters a topic joins with, or <code>undefined</code> for an unknown topic.</p>
+
+<h3 class="function"><a name="peek_ref-1">peek_ref/1</a></h3>
+<div class="spec">
+<p><code>peek_ref(X1::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; binary()</code><br></p>
+<p> </p>
+</div><p><p>The reference the next frame will carry.</p>
+ 
+  For a caller that needs to recognise the reply to a push: read it, push, and
+  the <code>{reply, Topic, Ref, Status, Response}</code> event that answers carries it.</p>
+
 <h3 class="function"><a name="push-3">push/3</a></h3>
 <div class="spec">
 <p><code>push(Event::binary(), Payload::map(), State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; {<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>, [<a href="#type-action" docgen-rel="seetype" docgen-href="#action/0">action()</a>]}</code><br></p>
@@ -145,6 +185,16 @@ two different frames with the same reference.</p>
 <p><code>push(Topic::binary(), Event::binary(), Payload::map(), State0::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; {<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>, [<a href="#type-action" docgen-rel="seetype" docgen-href="#action/0">action()</a>]}</code><br></p>
 <p> </p>
 </div><p>Push an event to a named topic.</p>
+
+<h3 class="function"><a name="set_params-3">set_params/3</a></h3>
+<div class="spec">
+<p><code>set_params(Topic::binary(), Params::map(), State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; <a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a></code><br></p>
+<p> </p>
+</div><p><p>Replace what a topic joins with next time, without joining it now.</p>
+ 
+  For what changes while connected and has to be right on the next join: a
+  firmware that validated after joining, say, must not rejoin claiming it has
+  not.</p>
 
 <h3 class="function"><a name="topics-1">topics/1</a></h3>
 <div class="spec">

@@ -37,14 +37,35 @@ dropped silently.</p>
   is sent rather than a line dated 1970. See `nh_ext_health:timestamp/0</code> for
   the same rule.
 <h2><a name="index">Function Index</a></h2>
-<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#event-0">event/0</a></td><td>The scoped event a log line is sent as.</td></tr>
+<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#batch-1">batch/1</a></td><td>The payload for version 0.1.0, which carries lines in batches.</td></tr>
+<tr><td valign="top"><a href="#dropped_line-1">dropped_line/1</a></td><td>A line saying that <code>Count</code> lines were dropped to make room.</td></tr>
+<tr><td valign="top"><a href="#event-0">event/0</a></td><td>The scoped event a log line is sent as.</td></tr>
 <tr><td valign="top"><a href="#line-2">line/2</a></td><td>Equivalent to <a href="#line-3" docgen-rel="seemfa" docgen-href="#line/3"><code>line(Level, Message, #{})</code></a>.
 </td></tr>
 <tr><td valign="top"><a href="#line-3">line/3</a></td><td>Build a log line NervesHub will accept.</td></tr>
 <tr><td valign="top"><a href="#line_at-4">line_at/4</a></td><td>Build a log line stamped with a time the caller already has.</td></tr>
+<tr><td valign="top"><a href="#max_batch-0">max_batch/0</a></td><td>The most lines one batch may carry.</td></tr>
 </table>
 
 <h2><a name="functions">Function Details</a></h2>
+
+<h3 class="function"><a name="batch-1">batch/1</a></h3>
+<div class="spec">
+<p><code>batch(Lines::[map()]) -&gt; map()</code><br></p>
+<p> </p>
+</div><p><p>The payload for version 0.1.0, which carries lines in batches.</p>
+ 
+  <pre>  logging:send  #{lines =&gt; [#{level, message, meta}, ...]}   device -&gt; server</pre>
+ 
+  Each line is exactly what version 0.0.1 sends on its own. NervesHub limits
+  how often a device may send, so one message for many lines is the difference
+  between a burst at boot arriving and most of it being refused.</p>
+
+<h3 class="function"><a name="dropped_line-1">dropped_line/1</a></h3>
+<div class="spec">
+<p><code>dropped_line(Count::pos_integer()) -&gt; {ok, map()} | {error, no_clock}</code><br></p>
+<p> </p>
+</div><p>A line saying that <code>Count</code> lines were dropped to make room.</p>
 
 <h3 class="function"><a name="event-0">event/0</a></h3>
 <div class="spec">
@@ -77,6 +98,12 @@ dropped silently.</p>
   <code>logger</code> hands a handler the moment the event was created, in microseconds,
   which is exactly what NervesHub wants. Using it rather than reading the clock
   again keeps a line stamped when it happened rather than when it was sent.</p>
+
+<h3 class="function"><a name="max_batch-0">max_batch/0</a></h3>
+<div class="spec">
+<p><code>max_batch() -&gt; pos_integer()</code><br></p>
+<p> </p>
+</div><p>The most lines one batch may carry.</p>
 <hr>
 
 <div class="navbar"><a name="#navbar_bottom"></a><table width="100%" border="0" cellspacing="0" cellpadding="2" summary="navigation bar"><tr><td><a href="overview-summary.html" target="overviewFrame">Overview</a></td><td><a href="http://www.erlang.org/"><img src="erlang.png" align="right" border="0" alt="erlang logo"></a></td></tr></table></div>

@@ -27,6 +27,20 @@
 %% Order matters: until the boot path is written the device still boots what it
 %% was running, so a failure at any earlier point costs nothing but the
 %% download.
+%%
+%% == When the connection drops ==
+%%
+%% A download that fails part way is tried again, resuming from the last byte
+%% received with a `Range' request, a few times with a growing pause between.
+%% Only a failure another attempt would not fix — a 404, a flash write that
+%% failed — ends it at once. A server that answers a `Range' request with the
+%% whole archive gets it taken from the start, after erasing again.
+%%
+%% == On trial ==
+%%
+%% Arming an update puts it on trial. `begin_trial/1' counts each boot of it,
+%% `commit/0' ends the trial once it has proved itself, and `revert/0' points
+%% the device back at what it ran before. `nh_agent' drives all three.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_ota).
@@ -34,6 +48,7 @@
 -export([available/0, available/1, apply_update/1, apply_update/2]).
 -export([start_update/2, start_update/3]).
 -export([pending/0, pending/1, commit/0, commit/1, revert/0, revert/1]).
+-export([begin_trial/1, begin_trial/2, reverted/0, reverted/1]).
 -export([parse_url/1, digest_matches/2]).
 
 %% Our own NVS namespace. `atomvm' belongs to the loader, and writing our
@@ -41,12 +56,17 @@
 -define(NVS_NAMESPACE, nerves_hub).
 -define(NVS_PENDING, pending_slot).
 -define(NVS_PREVIOUS, previous_slot).
+-define(NVS_BOOT_ATTEMPTS, boot_attempts).
+-define(NVS_REVERTED, reverted).
 
 %% Buffered before each flash write. One erase sector, so writes stay aligned
 %% and a chunky download does not turn into hundreds of tiny writes.
 -define(BLOCK_SIZE, 4096).
 
-%% How much of the socket to take at once.
+%% How many times a download is tried again after the first attempt fails, and
+%% how long to wait between: from the first delay, doubling to the second.
+-define(DEFAULT_MAX_RETRIES, 5).
+-define(DEFAULT_RETRY_BACKOFF, {2000, 30000}).
 
 -type update_result() :: {ok, binary()} | {error, term()}.
 
@@ -94,8 +114,18 @@ apply_update(Payload) -> apply_update(Payload, #{}).
 %% @doc Download and install an update, returning the slot it was written to.
 %%
 %% `Payload' is what NervesHub sends: `firmware_url', `size' and `checksum'.
-%% `Opts' may carry a `progress' function of one argument, called with a
-%% percentage as the download proceeds, and a `slot' to override the target.
+%% `Opts' may carry:
+%%
+%% <ul>
+%%   <li>`progress', a function of one argument, called with a percentage as
+%%       the download proceeds</li>
+%%   <li>`started', a function of none, called as each attempt begins</li>
+%%   <li>`slot', to override the target</li>
+%%   <li>`max_retries', how many times to try again after the first attempt
+%%       fails, 5 by default</li>
+%%   <li>`retry_backoff', `{FirstMs, MaxMs}' between attempts, `{2000, 30000}'
+%%       by default</li>
+%% </ul>
 %% @end
 %%-----------------------------------------------------------------------------
 -spec apply_update(map(), map()) -> update_result().
@@ -149,45 +179,85 @@ erase(Slot, Size, Opts) when is_integer(Size), Size > 0 ->
 erase(_Slot, Size, _Opts) ->
     {error, {invalid_update_size, Size}}.
 
-fetch(
-    Slot,
+fetch(Slot, Parsed, Size, Checksum, Progress, Opts) ->
+    State = #{
+        slot => Slot,
+        keys => maps:get(keys, Opts, []),
+        opts => Opts,
+        offset => 0,
+        written => 0,
+        buffer => <<>>,
+        hash => crypto:hash_init(sha256),
+        size => Size,
+        progress => Progress,
+        reported => -1,
+        status => undefined,
+        retries => 0
+    },
+    finish(download(Parsed, State), Slot, Checksum, Opts).
+
+%% One attempt after another until the archive is in, a failure that another
+%% attempt would not fix, or the retries run out.
+%%
+%% A retry carries on from the last byte received rather than starting again:
+%% the hash is kept as it was, so the bytes a `Range' request returns extend
+%% the same digest. On a device a download is the longest a socket is held
+%% open, and restarting a few hundred kilobytes over a weak link because the
+%% last few failed is how an update never finishes.
+download(Parsed, #{retries := Retries, opts := Opts} = State) ->
+    case attempt(Parsed, State) of
+        {complete, Final} ->
+            flush(Final);
+        {retry, Reason, Next} ->
+            Max = maps:get(max_retries, Opts, ?DEFAULT_MAX_RETRIES),
+            case Retries < Max of
+                true ->
+                    _ = timer:sleep(retry_delay(Retries, Opts)),
+                    download(Parsed, Next#{retries => Retries + 1});
+                false ->
+                    {error, {download_failed, Reason}}
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+retry_delay(Retries, Opts) ->
+    {Min, Max} = maps:get(retry_backoff, Opts, ?DEFAULT_RETRY_BACKOFF),
+    nh_backoff:delay(Retries, Min, Max).
+
+attempt(
     #{protocol := Protocol, host := Host, port := Port, path := Path},
-    Size,
-    Checksum,
-    Progress,
-    Opts
+    #{opts := Opts} = State
 ) ->
     Http = http(Opts),
+    Started = maps:get(started, Opts, fun() -> ok end),
+    _ = Started(),
 
     %% Passive because AtomVM's `ssl' asserts `{active, false}', and verified
     %% against the bundled CAs. A tampered archive is refused regardless:
     %% `finish/4' checks the sha256 NervesHub sent over the device socket.
     case Http:connect(Protocol, Host, Port, [{active, false}, {verify, verify_peer}]) of
         {ok, Conn} ->
-            case Http:request(Conn, <<"GET">>, Path, [], undefined) of
+            case Http:request(Conn, <<"GET">>, Path, range(State), undefined) of
                 {ok, Conn2, _Ref} ->
-                    State = #{
-                        slot => Slot,
-                        keys => maps:get(keys, Opts, []),
-                        opts => Opts,
-                        offset => 0,
-                        written => 0,
-                        buffer => <<>>,
-                        hash => crypto:hash_init(sha256),
-                        size => Size,
-                        progress => Progress,
-                        reported => -1,
-                        status => undefined
-                    },
-                    Result = recv_loop(Conn2, State),
+                    Result = recv_loop(Conn2, State#{status => undefined}),
                     _ = Http:close(Conn2),
-                    finish(Result, Slot, Checksum, Opts);
+                    Result;
                 {error, Reason} ->
                     _ = Http:close(Conn),
-                    {error, {request_failed, Reason}}
+                    {retry, {request_failed, Reason}, State}
             end;
         {error, Reason} ->
-            {error, {connect_failed, Reason}}
+            {retry, {connect_failed, Reason}, State}
+    end.
+
+%% Everything received so far, whether written yet or still buffered.
+received(#{offset := Offset, buffer := Buffer}) -> Offset + byte_size(Buffer).
+
+range(State) ->
+    case received(State) of
+        0 -> [];
+        From -> [{<<"Range">>, <<"bytes=", (integer_to_binary(From))/binary, "-">>}]
     end.
 
 recv_loop(Conn, #{opts := Opts} = State) ->
@@ -196,29 +266,44 @@ recv_loop(Conn, #{opts := Opts} = State) ->
     case Http:recv(Conn, 0) of
         {ok, Conn2, Responses} ->
             case handle(Responses, State) of
-                {done, Final} -> flush(Final);
+                {done, Final} -> ended(Final, done);
                 {continue, Next} -> recv_loop(Conn2, Next);
-                {error, _} = Error -> Error
+                Other -> Other
             end;
         %% Passive mode reports a peer close as an error even when the response
         %% was complete, which is how a body with no length ends.
         {error, {_Transport, closed}} ->
-            flush(State);
+            ended(State, closed);
         {error, Reason} ->
-            {error, {stream_failed, Reason}}
+            {retry, {stream_failed, Reason}, State}
     end.
+
+%% The response ended. Whether that was the whole archive is a question for the
+%% size NervesHub sent, not for the socket: a connection that drops cleanly
+%% halfway looks exactly like one that finished.
+ended(#{status := undefined} = State, How) ->
+    {retry, {no_response, How}, State};
+ended(#{size := Size} = State, How) when is_integer(Size) ->
+    case received(State) of
+        Received when Received < Size -> {retry, {incomplete, How, Received}, State};
+        _ -> {complete, State}
+    end;
+ended(State, _How) ->
+    {complete, State}.
 
 handle([], State) ->
     {continue, State};
 handle([{status, _Ref, Status} | Rest], State) ->
-    case Status of
-        200 -> handle(Rest, State#{status => 200});
-        Other -> {error, {http_status, Other}}
+    case status(Status, State) of
+        {ok, Next} -> handle(Rest, Next);
+        Other -> Other
     end;
 handle([{header, _Ref, _Header} | Rest], State) ->
     handle(Rest, State);
 handle([{trailer_header, _Ref, _Header} | Rest], State) ->
     handle(Rest, State);
+handle([{data, _Ref, _Chunk} | _Rest], #{status := undefined} = State) ->
+    {retry, body_before_status, State};
 handle([{data, _Ref, Chunk} | Rest], State) ->
     case write(Chunk, State) of
         {ok, Next} -> handle(Rest, Next);
@@ -226,6 +311,37 @@ handle([{data, _Ref, Chunk} | Rest], State) ->
     end;
 handle([{done, _Ref} | _Rest], State) ->
     {done, State}.
+
+%% 206 is the rest of the archive from where the last attempt stopped. 200 is
+%% all of it: a server that ignores `Range' is allowed to, and the only thing
+%% to do is start again — erasing first, since flash can only be written once
+%% between erases. A 5xx may pass; anything else in the 4xx range will not,
+%% and asking again only delays saying so.
+status(206, State) ->
+    {ok, State#{status => 206}};
+status(200, State) ->
+    case received(State) of
+        0 -> {ok, State#{status => 200}};
+        _Some -> restart(State)
+    end;
+status(Status, State) when Status >= 500 ->
+    {retry, {http_status, Status}, State};
+status(Status, _State) ->
+    {error, {http_status, Status}}.
+
+restart(#{slot := Slot, size := Size, opts := Opts} = State) ->
+    case erase(Slot, Size, Opts) of
+        ok ->
+            {ok, State#{
+                status => 200,
+                offset => 0,
+                written => 0,
+                buffer => <<>>,
+                hash => crypto:hash_init(sha256)
+            }};
+        {error, _} = Error ->
+            Error
+    end.
 
 %% Buffer to a block, write whole blocks, keep the remainder. The hash covers
 %% the bytes as they arrive, so it catches corruption in flight rather than
@@ -328,6 +444,7 @@ arm(Slot, _Metadata, _Written, Opts) ->
 
     with_ok(
         [
+            fun() -> nvs_erase(?NVS_BOOT_ATTEMPTS, Opts) end,
             fun() -> nvs_put(?NVS_PREVIOUS, Previous, Opts) end,
             fun() -> nvs_put(?NVS_PENDING, Slot, Opts) end,
             fun() -> nvs_put_atomvm_boot_path(nh_slots:boot_path(Slot), Opts) end
@@ -381,8 +498,16 @@ commit() -> commit(#{}).
 %%-----------------------------------------------------------------------------
 -spec commit(map()) -> ok | {error, term()}.
 commit(Opts) ->
-    case nvs_erase(?NVS_PENDING, Opts) of
-        ok -> nvs_erase(?NVS_PREVIOUS, Opts);
+    Steps = [
+        fun() -> nvs_erase(?NVS_PENDING, Opts) end,
+        fun() -> nvs_erase(?NVS_PREVIOUS, Opts) end,
+        fun() -> nvs_erase(?NVS_BOOT_ATTEMPTS, Opts) end,
+        %% A firmware that proved itself is the end of whatever revert came
+        %% before it, so the device stops reporting one.
+        fun() -> nvs_erase(?NVS_REVERTED, Opts) end
+    ],
+    case with_ok(Steps, ok) of
+        {ok, ok} -> ok;
         {error, _} = Error -> Error
     end.
 
@@ -409,9 +534,88 @@ revert(Opts) ->
             case nvs_put_atomvm_boot_path(nh_slots:boot_path(Previous), Opts) of
                 ok ->
                     _ = commit(Opts),
+                    %% Remembered past the reboot, so the firmware that comes
+                    %% back up can tell NervesHub it is running because the
+                    %% update did not work.
+                    _ = nvs_put(?NVS_REVERTED, <<"1">>, Opts),
                     {ok, Previous};
                 {error, _} = Error ->
                     Error
+            end
+    end.
+
+%%-----------------------------------------------------------------------------
+%% @doc Whether this device is running firmware it reverted to.
+%%
+%% True from a revert until the next update proves itself.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec reverted() -> boolean().
+reverted() -> reverted(#{}).
+
+-spec reverted(map()) -> boolean().
+reverted(Opts) ->
+    nvs_get(?NVS_REVERTED, Opts) =:= <<"1">>.
+
+%%-----------------------------------------------------------------------------
+%% @equiv begin_trial(MaxAttempts, #{})
+%% @end
+%%-----------------------------------------------------------------------------
+-spec begin_trial(pos_integer()) -> none | {trial, binary(), pos_integer()} | {reverted, binary()}.
+begin_trial(MaxAttempts) -> begin_trial(MaxAttempts, #{}).
+
+%%-----------------------------------------------------------------------------
+%% @doc Count this boot against firmware that is on trial.
+%%
+%% Called once per boot, before anything that could fail. A firmware on trial
+%% gets `MaxAttempts' boots to reach NervesHub; one that has used them all is
+%% reverted here, and the caller should restart the device into what it was
+%% running before.
+%%
+%% Counting boots rather than trusting a timer is what catches the firmware
+%% that crashes before any timer could fire: each crash is a boot, and the
+%% count is in NVS where the crash cannot take it.
+%%
+%% Returns `none' for firmware that is not on trial, `{trial, Slot, Attempt}'
+%% for one that has boots left, and `{reverted, Previous}' for one that had
+%% none.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec begin_trial(pos_integer(), map()) ->
+    none | {trial, binary(), pos_integer()} | {reverted, binary()}.
+begin_trial(MaxAttempts, Opts) ->
+    case pending(Opts) of
+        none ->
+            none;
+        {ok, Slot} ->
+            Attempt = boot_attempts(Opts) + 1,
+            case Attempt > MaxAttempts of
+                true ->
+                    case revert(Opts) of
+                        {ok, Previous} ->
+                            {reverted, Previous};
+                        {error, _} ->
+                            %% Nothing to go back to. Carrying on is the only
+                            %% option left, and counting further would not
+                            %% change that.
+                            {trial, Slot, Attempt}
+                    end;
+                false ->
+                    _ = nvs_put(?NVS_BOOT_ATTEMPTS, integer_to_binary(Attempt), Opts),
+                    {trial, Slot, Attempt}
+            end
+    end.
+
+boot_attempts(Opts) ->
+    case nvs_get(?NVS_BOOT_ATTEMPTS, Opts) of
+        undefined ->
+            0;
+        Bin ->
+            try binary_to_integer(Bin) of
+                N when N >= 0 -> N;
+                _ -> 0
+            catch
+                _:_ -> 0
             end
     end.
 
@@ -420,7 +624,8 @@ revert(Opts) ->
 %%
 %% The download takes as long as it takes, and the agent has heartbeats to send
 %% while it runs — so it does not run on the agent's process. The caller
-%% receives `{nh_ota, self(), {progress, Percent}}' as it goes and
+%% receives `{nh_ota, self(), started}' each time a download attempt begins,
+%% `{nh_ota, self(), {progress, Percent}}' as it goes and
 %% `{nh_ota, self(), Result}' at the end.
 %% @end
 %%-----------------------------------------------------------------------------
@@ -441,7 +646,10 @@ start_update(Payload, Owner, Opts) ->
         spawn_monitor(fun() ->
             Self = self(),
             Progress = fun(Percent) -> Owner ! {nh_ota, Self, {progress, Percent}} end,
-            Owner ! {nh_ota, Self, apply_update(Payload, Opts#{progress => Progress})}
+            Started = fun() -> Owner ! {nh_ota, Self, started} end,
+            Owner !
+                {nh_ota, Self,
+                    apply_update(Payload, Opts#{progress => Progress, started => Started})}
         end),
 
     Pid.

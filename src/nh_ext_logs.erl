@@ -32,10 +32,18 @@
 %%-----------------------------------------------------------------------------
 -module(nh_ext_logs).
 
--export([line/2, line/3, line_at/4, event/0]).
+-export([line/2, line/3, line_at/4, event/0, batch/1, dropped_line/1, max_batch/0]).
 
 %% Anything below the epoch-plus-a-few-decades is a clock that was never set.
 -define(EARLIEST_PLAUSIBLE_TIME, 1700000000).
+
+%% NervesHub takes at most this many lines in one batched message and replaces
+%% the rest with a warning, so a batch is never built bigger.
+-define(MAX_BATCH, 100).
+
+%% NervesHub truncates a message longer than this, and on an ESP32 a line that
+%% long is more likely a runaway `~p' than something worth the heap.
+-define(MAX_MESSAGE_BYTES, 8192).
 
 %%-----------------------------------------------------------------------------
 %% @doc The scoped event a log line is sent as.
@@ -43,6 +51,40 @@
 %%-----------------------------------------------------------------------------
 -spec event() -> binary().
 event() -> <<"logging:send">>.
+
+%%-----------------------------------------------------------------------------
+%% @doc The payload for version 0.1.0, which carries lines in batches.
+%%
+%% ```
+%% logging:send  #{lines => [#{level, message, meta}, ...]}   device -> server
+%% '''
+%%
+%% Each line is exactly what version 0.0.1 sends on its own. NervesHub limits
+%% how often a device may send, so one message for many lines is the difference
+%% between a burst at boot arriving and most of it being refused.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec batch([map()]) -> map().
+batch(Lines) -> #{<<"lines">> => Lines}.
+
+%%-----------------------------------------------------------------------------
+%% @doc The most lines one batch may carry.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec max_batch() -> pos_integer().
+max_batch() -> ?MAX_BATCH.
+
+%%-----------------------------------------------------------------------------
+%% @doc A line saying that `Count' lines were dropped to make room.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec dropped_line(pos_integer()) -> {ok, map()} | {error, no_clock}.
+dropped_line(Count) ->
+    line(
+        <<"warning">>,
+        <<"nerves_hub_link dropped ", (integer_to_binary(Count))/binary,
+            " log lines: the buffer was full">>
+    ).
 
 %%-----------------------------------------------------------------------------
 %% @equiv line(Level, Message, #{})
@@ -81,7 +123,7 @@ line_at(_Level, _Message, _Meta, Micros) when
 line_at(Level, Message, Meta, Micros) ->
     {ok, #{
         <<"level">> => Level,
-        <<"message">> => Message,
+        <<"message">> => truncate(Message),
         <<"meta">> => maps:merge(stringify(Meta), #{<<"time">> => integer_to_binary(Micros)})
     }}.
 
@@ -91,6 +133,22 @@ micros() ->
         _ -> undefined
     catch
         _:_ -> undefined
+    end.
+
+%% Cut on a character boundary: half a UTF-8 sequence is not a string, and the
+%% JSON encoder refuses the whole message over it.
+truncate(Message) when is_binary(Message), byte_size(Message) > ?MAX_MESSAGE_BYTES ->
+    <<(binary:part(Message, 0, boundary(Message, ?MAX_MESSAGE_BYTES)))/binary, "...">>;
+truncate(Message) ->
+    Message.
+
+%% Back up past continuation bytes (2#10xxxxxx) to the start of a character.
+boundary(_Message, 0) ->
+    0;
+boundary(Message, Cut) ->
+    case binary:at(Message, Cut) band 16#C0 of
+        16#80 -> boundary(Message, Cut - 1);
+        _ -> Cut
     end.
 
 %% NervesHub stores meta as a string map. A number sent here is stored as a

@@ -35,7 +35,9 @@ stop() ->
             ok
     end.
 
-%% Everything written to the slot, in order, as one binary.
+%% The slot as the writes left it: each one laid down at its offset, later ones
+%% over earlier ones, as flash would hold them after a download that started
+%% again from the beginning.
 written() -> call(written).
 
 erased() -> call(erased).
@@ -97,8 +99,29 @@ handle({nvs_erase, _Ns, _Key}, #{fail := nvs_erase} = State) ->
 handle({nvs_erase, Ns, Key}, #{nvs := Nvs} = State) ->
     {ok, State#{nvs => maps:remove({Ns, Key}, Nvs)}};
 handle(written, #{writes := Writes} = State) ->
-    {iolist_to_binary([D || {_S, _O, D} <- Writes]), State};
+    {image(Writes), State};
 handle(erased, #{erases := Erases} = State) ->
     {Erases, State};
 handle(nvs, #{nvs := Nvs} = State) ->
     {Nvs, State}.
+
+image(Writes) ->
+    lists:foldl(
+        fun({_Slot, Offset, Data}, Image) ->
+            Padded =
+                case Offset - byte_size(Image) of
+                    Gap when Gap > 0 -> <<Image/binary, 0:(Gap * 8)>>;
+                    _ -> Image
+                end,
+            Before = binary:part(Padded, 0, Offset),
+            AfterStart = Offset + byte_size(Data),
+            After =
+                case byte_size(Padded) > AfterStart of
+                    true -> binary:part(Padded, AfterStart, byte_size(Padded) - AfterStart);
+                    false -> <<>>
+                end,
+            <<Before/binary, Data/binary, After/binary>>
+        end,
+        <<>>,
+        Writes
+    ).

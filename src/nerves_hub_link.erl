@@ -51,12 +51,26 @@
 %% {update_ready, Slot}         %% written and armed; reboot when ready
 %% {update_failed, Reason}
 %% {firmware_committed, Slot}   %% the running update proved itself
+%% {firmware_trial, Slot, Boot} %% booted an update not yet proved
+%% {firmware_reverted, Slot}    %% it never proved itself; Slot boots next
+%% {update_mode, Mode, Allowed}
+%% {update_rejected, Reason}
 %% identify                     %% blink something
 %% reboot_requested
 %% console_joined
-%% {disconnected, Reason}
+%% {extensions_attached, Names}
+%% {extension_detached, Name}
+%% {disconnected, Reason}       %% the agent reconnects
 %% {transport_error, Reason}
 %% '''
+%%
+%% == Updates the device decides on ==
+%%
+%% `updates => manual' reports an offer and waits for `apply_update/2',
+%% `ignore_update/2' or `reschedule_update/3'. A product that allows it can
+%% put a device in `device_managed' mode with `set_update_mode/2', after which
+%% NervesHub stops pushing and the device asks: `check_for_update/1' and
+%% `request_update/1'.
 %%
 %% == Authentication ==
 %%
@@ -91,8 +105,8 @@
 %%       device. `reboot => manual' reports `reboot_requested' and leaves the
 %%       decision alone.</li>
 %%   <li>`reconnect' is not a device message at all — NervesHub drops the
-%%       socket and the transport reconnects, so there is nothing to
-%%       implement.</li>
+%%       socket and the agent reconnects, signing the new connection afresh,
+%%       so there is nothing to implement.</li>
 %% </ul>
 %%
 %% == Sending logs ==
@@ -203,6 +217,8 @@
 -export([update_progress/2, update_progress/3, firmware_validated/1, update_failed/2]).
 -export([push/3]).
 -export([send_log/3, send_log/4]).
+-export([check_for_update/1, request_update/1, set_update_mode/2, update_mode/1]).
+-export([apply_update/2, ignore_update/2, reschedule_update/3]).
 
 -type firmware_source() :: boot | {partition, binary()} | {metadata, map()} | none.
 
@@ -220,6 +236,11 @@
     updates => auto | manual,
     firmware_keys => [binary() | string()],
     request_firmware_keys => boolean(),
+    firmware_trial => #{boot_attempts => pos_integer(), join_timeout_ms => pos_integer()} | off,
+    network_interface => binary(),
+    reconnect_backoff => {pos_integer(), pos_integer()},
+    log_flush_ms => pos_integer(),
+    log_buffer => pos_integer(),
     capture_io => boolean() | map(),
     register => atom(),
     handler => pid(),
@@ -227,7 +248,12 @@
     transport => module()
 }.
 
--export_type([config/0, firmware_source/0]).
+-type update_mode() :: #{
+    mode := automatic | device_managed | off | unknown,
+    managed_updates_allowed := boolean()
+}.
+
+-export_type([config/0, firmware_source/0, update_mode/0]).
 
 %%-----------------------------------------------------------------------------
 %% @doc Connect, linked to the calling process.
@@ -315,7 +341,116 @@ push(Pid, Event, Payload) ->
     Pid ! {push, Event, Payload},
     ok.
 
+%%-----------------------------------------------------------------------------
+%% @doc Ask NervesHub whether there is an update for this device.
+%%
+%% Asks, and does nothing else: `request_update/1' is what fetches it. Answered
+%% for a device in either update mode.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec check_for_update(pid()) ->
+    {ok, #{available := boolean(), firmware_meta := map() | null}} | {error, term()}.
+check_for_update(Pid) ->
+    call(Pid, check_update).
+
+%%-----------------------------------------------------------------------------
+%% @doc Ask NervesHub for the update, and install it when it comes.
+%%
+%% This is how a device in `device_managed' mode updates: NervesHub does not
+%% push to it, and waits to be asked. `ok' means NervesHub sent the update and
+%% the download has begun; how it ends arrives as `{update_ready, Slot}' or
+%% `{update_failed, Reason}', as for any other update. Installed even with
+%% `updates => manual', since asking was the decision.
+%%
+%% Refused with `{error, Reason}' where `Reason' is NervesHub's —
+%% `no_update', `no_deployment_group', `already_updating' — or `updating' when
+%% this device is already part way through one.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec request_update(pid()) -> ok | {error, term()}.
+request_update(Pid) ->
+    call(Pid, request_update).
+
+%%-----------------------------------------------------------------------------
+%% @doc Choose who decides when this device updates.
+%%
+%% `automatic' is NervesHub's deployments pushing updates as they always have.
+%% `device_managed' stops the pushes and leaves it to `request_update/1'. A
+%% device may only switch to `device_managed' when its product allows it, and
+%% NervesHub answers `{error, not_permitted}' otherwise. Setting `off' is
+%% reserved for an operator.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec set_update_mode(pid(), automatic | device_managed) -> {ok, update_mode()} | {error, term()}.
+set_update_mode(Pid, Mode) when Mode =:= automatic; Mode =:= device_managed ->
+    call(Pid, {set_update_mode, atom_to_binary(Mode, utf8)});
+set_update_mode(_Pid, Mode) ->
+    {error, {invalid_update_mode, Mode}}.
+
+%%-----------------------------------------------------------------------------
+%% @doc The update mode NervesHub last reported, without asking it again.
+%%
+%% NervesHub reports it after every join and whenever it changes, and each
+%% report also reaches the handler as `{update_mode, Mode, ManagedAllowed}'.
+%% `{error, unknown}' until the first one arrives.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec update_mode(pid()) -> {ok, update_mode()} | {error, term()}.
+update_mode(Pid) ->
+    call(Pid, update_mode).
+
+%%-----------------------------------------------------------------------------
+%% @doc Install an update that `updates => manual' reported and did not act on.
+%%
+%% `Payload' is the one from `{message, <<"update">>, Payload}'.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec apply_update(pid(), map()) -> ok.
+apply_update(Pid, Payload) when is_map(Payload) ->
+    Pid ! {update_decision, {apply, Payload}},
+    ok.
+
+%%-----------------------------------------------------------------------------
+%% @doc Decline an update, telling NervesHub why.
+%%
+%% NervesHub holds further updates back for the deployment's penalty timeout,
+%% rather than offering the same one again at once.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec ignore_update(pid(), binary()) -> ok.
+ignore_update(Pid, Reason) when is_binary(Reason) ->
+    Pid ! {update_decision, {ignore, Reason}},
+    ok.
+
+%%-----------------------------------------------------------------------------
+%% @doc Not now: ask NervesHub to offer the update again in `DelayMs'.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec reschedule_update(pid(), pos_integer(), binary()) -> ok.
+reschedule_update(Pid, DelayMs, Reason) when is_integer(DelayMs), DelayMs > 0, is_binary(Reason) ->
+    Pid ! {update_decision, {reschedule, DelayMs, Reason}},
+    ok.
+
 %% ------------------------------------------------------------------- internals
+
+%% NervesHub gives a request 30 seconds and the agent times it out then; this
+%% waits a little longer so the agent's answer is the one that arrives.
+-define(CALL_TIMEOUT_MS, 35000).
+
+call(Pid, Request) ->
+    Monitor = erlang:monitor(process, Pid),
+    Tag = make_ref(),
+    Pid ! {call, self(), Tag, Request},
+    receive
+        {Tag, Reply} ->
+            erlang:demonitor(Monitor, [flush]),
+            Reply;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            {error, {agent_down, Reason}}
+    after ?CALL_TIMEOUT_MS ->
+        erlang:demonitor(Monitor, [flush]),
+        {error, timeout}
+    end.
 
 %% A keyword list is what an Elixir caller reaches for, and this library is
 %% meant to be usable from Elixir without a wrapper in between.

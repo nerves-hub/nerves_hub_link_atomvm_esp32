@@ -53,6 +53,7 @@ and it is not a way in to a running system — it reports, and it reboots.</p>
 <tr><td valign="top"><a href="#parse-1">parse/1</a></td><td>Split a line into a command and its arguments.</td></tr>
 <tr><td valign="top"><a href="#prompt-0">prompt/0</a></td><td></td></tr>
 <tr><td valign="top"><a href="#restart-1">restart/1</a></td><td>Reset the session, as <code>restart</code> does to IEx on Nerves.</td></tr>
+<tr><td valign="top"><a href="#run_command-1">run_command/1</a></td><td>Run one command line, saying whether it was a command at all.</td></tr>
 </table>
 
 <h2><a name="functions">Function Details</a></h2>
@@ -104,6 +105,16 @@ and it is not a way in to a running system — it reports, and it reboots.</p>
 <p><code>restart(State::<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>) -&gt; {<a href="#type-state" docgen-rel="seetype" docgen-href="#state/0">state()</a>, binary()}</code><br></p>
 <p> </p>
 </div><p>Reset the session, as <code>restart</code> does to IEx on Nerves.</p>
+
+<h3 class="function"><a name="run_command-1">run_command/1</a></h3>
+<div class="spec">
+<p><code>run_command(Line::binary()) -&gt; {ok, binary()} | {error, binary()}</code><br></p>
+<p> </p>
+</div><p><p>Run one command line, saying whether it was a command at all.</p>
+ 
+  The console only prints, so it does not care. A script does: a line that is
+  not a command is a script that did not do what it says, and NervesHub should
+  hear that it failed rather than that it completed.</p>
 <hr>
 
 <div class="navbar"><a name="#navbar_bottom"></a><table width="100%" border="0" cellspacing="0" cellpadding="2" summary="navigation bar"><tr><td><a href="overview-summary.html" target="overviewFrame">Overview</a></td><td><a href="http://www.erlang.org/"><img src="erlang.png" align="right" border="0" alt="erlang logo"></a></td></tr></table></div>

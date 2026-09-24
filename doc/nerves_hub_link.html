@@ -54,11 +54,25 @@ filled in:</p>
   {update_ready, Slot}         %% written and armed; reboot when ready
   {update_failed, Reason}
   {firmware_committed, Slot}   %% the running update proved itself
+  {firmware_trial, Slot, Boot} %% booted an update not yet proved
+  {firmware_reverted, Slot}    %% it never proved itself; Slot boots next
+  {update_mode, Mode, Allowed}
+  {update_rejected, Reason}
   identify                     %% blink something
   reboot_requested
   console_joined
-  {disconnected, Reason}
+  {extensions_attached, Names}
+  {extension_detached, Name}
+  {disconnected, Reason}       %% the agent reconnects
   {transport_error, Reason}</pre>
+ 
+  <h3><a name="Updates_the_device_decides_on">Updates the device decides on</a></h3>
+ 
+  <p><code>updates =&gt; manual</code> reports an offer and waits for <code>apply_update/2</code>,
+  <code>ignore_update/2</code> or <code>reschedule_update/3</code>. A product that allows it can
+  put a device in <code>device_managed</code> mode with <code>set_update_mode/2</code>, after which
+  NervesHub stops pushing and the device asks: <code>check_for_update/1</code> and
+  <code>request_update/1</code>.</p>
  
   <h3><a name="Authentication">Authentication</a></h3>
  
@@ -93,8 +107,8 @@ messages on the device topic and one does not:</p>
         device. <code>reboot =&gt; manual</code> reports <code>reboot_requested</code> and leaves the
         decision alone.</li>
     <li><code>reconnect</code> is not a device message at all — NervesHub drops the
-        socket and the transport reconnects, so there is nothing to
-        implement.</li>
+        socket and the agent reconnects, signing the new connection afresh,
+        so there is nothing to implement.</li>
   </ul>
  
   <h3><a name="Sending_logs">Sending logs</a></h3>
@@ -190,28 +204,56 @@ with no keys installs what NervesHub sent it.</p>
 <h2><a name="types">Data Types</a></h2>
 
 <h3 class="typedecl"><a name="type-config">config()</a></h3>
-<p><code>config() = #{url =&gt; binary() | string(), host =&gt; binary() | string(), identifier := binary(), firmware =&gt; <a href="#type-firmware_source" docgen-rel="seetype" docgen-href="#firmware_source/0">firmware_source()</a>, shared_secret =&gt; {binary(), binary()}, client_cert =&gt; {binary(), binary()}, verify =&gt; crt_bundle | {cacert_pem, binary()} | none, console =&gt; boolean(), extensions =&gt; all | [health | geo | logging], reboot =&gt; auto | manual, updates =&gt; auto | manual, firmware_keys =&gt; [binary() | string()], request_firmware_keys =&gt; boolean(), capture_io =&gt; boolean() | map(), register =&gt; atom(), handler =&gt; pid(), heartbeat_ms =&gt; pos_integer(), transport =&gt; module()}</code></p>
+<p><code>config() = #{url =&gt; binary() | string(), host =&gt; binary() | string(), identifier := binary(), firmware =&gt; <a href="#type-firmware_source" docgen-rel="seetype" docgen-href="#firmware_source/0">firmware_source()</a>, shared_secret =&gt; {binary(), binary()}, client_cert =&gt; {binary(), binary()}, verify =&gt; crt_bundle | {cacert_pem, binary()} | none, console =&gt; boolean(), extensions =&gt; all | [health | geo | logging], reboot =&gt; auto | manual, updates =&gt; auto | manual, firmware_keys =&gt; [binary() | string()], request_firmware_keys =&gt; boolean(), firmware_trial =&gt; #{boot_attempts =&gt; pos_integer(), join_timeout_ms =&gt; pos_integer()} | off, network_interface =&gt; binary(), reconnect_backoff =&gt; {pos_integer(), pos_integer()}, log_flush_ms =&gt; pos_integer(), log_buffer =&gt; pos_integer(), capture_io =&gt; boolean() | map(), register =&gt; atom(), handler =&gt; pid(), heartbeat_ms =&gt; pos_integer(), transport =&gt; module()}</code></p>
 
 
 <h3 class="typedecl"><a name="type-firmware_source">firmware_source()</a></h3>
 <p><code>firmware_source() = boot | {partition, binary()} | {metadata, map()} | none</code></p>
 
 
+<h3 class="typedecl"><a name="type-update_mode">update_mode()</a></h3>
+<p><code>update_mode() = #{mode := automatic | device_managed | off | unknown, managed_updates_allowed := boolean()}</code></p>
+
+
 <h2><a name="index">Function Index</a></h2>
-<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#firmware_validated-1">firmware_validated/1</a></td><td>Confirm that the newly booted firmware works.</td></tr>
+<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#apply_update-2">apply_update/2</a></td><td>Install an update that <code>updates =&gt; manual</code> reported and did not act on.</td></tr>
+<tr><td valign="top"><a href="#check_for_update-1">check_for_update/1</a></td><td>Ask NervesHub whether there is an update for this device.</td></tr>
+<tr><td valign="top"><a href="#firmware_validated-1">firmware_validated/1</a></td><td>Confirm that the newly booted firmware works.</td></tr>
+<tr><td valign="top"><a href="#ignore_update-2">ignore_update/2</a></td><td>Decline an update, telling NervesHub why.</td></tr>
 <tr><td valign="top"><a href="#push-3">push/3</a></td><td>Send an arbitrary event on the device channel.</td></tr>
+<tr><td valign="top"><a href="#request_update-1">request_update/1</a></td><td>Ask NervesHub for the update, and install it when it comes.</td></tr>
+<tr><td valign="top"><a href="#reschedule_update-3">reschedule_update/3</a></td><td>Not now: ask NervesHub to offer the update again in <code>DelayMs</code>.</td></tr>
 <tr><td valign="top"><a href="#send_log-3">send_log/3</a></td><td>Equivalent to <a href="#send_log-4" docgen-rel="seemfa" docgen-href="#send_log/4"><code>send_log(Pid, Level, Message, #{})</code></a>.
 </td></tr>
 <tr><td valign="top"><a href="#send_log-4">send_log/4</a></td><td>Send a log line to NervesHub, if the logging extension is attached.</td></tr>
+<tr><td valign="top"><a href="#set_update_mode-2">set_update_mode/2</a></td><td>Choose who decides when this device updates.</td></tr>
 <tr><td valign="top"><a href="#start-1">start/1</a></td><td></td></tr>
 <tr><td valign="top"><a href="#start_link-1">start_link/1</a></td><td>Connect, linked to the calling process.</td></tr>
 <tr><td valign="top"><a href="#stop-1">stop/1</a></td><td></td></tr>
 <tr><td valign="top"><a href="#update_failed-2">update_failed/2</a></td><td>Report that an update did not complete.</td></tr>
+<tr><td valign="top"><a href="#update_mode-1">update_mode/1</a></td><td>The update mode NervesHub last reported, without asking it again.</td></tr>
 <tr><td valign="top"><a href="#update_progress-2">update_progress/2</a></td><td>Report how far through an update the device is, as a percentage.</td></tr>
 <tr><td valign="top"><a href="#update_progress-3">update_progress/3</a></td><td>As <code>update_progress/2</code>, naming the stage: <code>downloading</code> or <code>updating</code>.</td></tr>
 </table>
 
 <h2><a name="functions">Function Details</a></h2>
+
+<h3 class="function"><a name="apply_update-2">apply_update/2</a></h3>
+<div class="spec">
+<p><code>apply_update(Pid::pid(), Payload::map()) -&gt; ok</code><br></p>
+<p> </p>
+</div><p><p>Install an update that <code>updates =&gt; manual</code> reported and did not act on.</p>
+ 
+  <code>Payload</code> is the one from <code>{message, &lt;&lt;"update"&gt;&gt;, Payload}</code>.</p>
+
+<h3 class="function"><a name="check_for_update-1">check_for_update/1</a></h3>
+<div class="spec">
+<p><code>check_for_update(Pid::pid()) -&gt; {ok, #{available := boolean(), firmware_meta := map() | null}} | {error, term()}</code><br></p>
+<p> </p>
+</div><p><p>Ask NervesHub whether there is an update for this device.</p>
+ 
+  Asks, and does nothing else: <code>request_update/1</code> is what fetches it. Answered
+  for a device in either update mode.</p>
 
 <h3 class="function"><a name="firmware_validated-1">firmware_validated/1</a></h3>
 <div class="spec">
@@ -222,11 +264,42 @@ with no keys installs what NervesHub sent it.</p>
   Pairs with <code>esp_ota_mark_app_valid_cancel_rollback()</code>: until something calls
   it, the bootloader will roll back to the previous image on the next boot.</p>
 
+<h3 class="function"><a name="ignore_update-2">ignore_update/2</a></h3>
+<div class="spec">
+<p><code>ignore_update(Pid::pid(), Reason::binary()) -&gt; ok</code><br></p>
+<p> </p>
+</div><p><p>Decline an update, telling NervesHub why.</p>
+ 
+  NervesHub holds further updates back for the deployment's penalty timeout,
+  rather than offering the same one again at once.</p>
+
 <h3 class="function"><a name="push-3">push/3</a></h3>
 <div class="spec">
 <p><code>push(Pid::pid(), Event::binary(), Payload::map()) -&gt; ok</code><br></p>
 <p> </p>
 </div><p>Send an arbitrary event on the device channel.</p>
+
+<h3 class="function"><a name="request_update-1">request_update/1</a></h3>
+<div class="spec">
+<p><code>request_update(Pid::pid()) -&gt; ok | {error, term()}</code><br></p>
+<p> </p>
+</div><p><p>Ask NervesHub for the update, and install it when it comes.</p>
+ 
+  <p>This is how a device in <code>device_managed</code> mode updates: NervesHub does not
+  push to it, and waits to be asked. <code>ok</code> means NervesHub sent the update and
+  the download has begun; how it ends arrives as <code>{update_ready, Slot}</code> or
+  <code>{update_failed, Reason}</code>, as for any other update. Installed even with
+  <code>updates =&gt; manual</code>, since asking was the decision.</p>
+ 
+  Refused with <code>{error, Reason}</code> where <code>Reason</code> is NervesHub's —
+  <code>no_update</code>, <code>no_deployment_group</code>, <code>already_updating</code> — or <code>updating</code> when
+  this device is already part way through one.</p>
+
+<h3 class="function"><a name="reschedule_update-3">reschedule_update/3</a></h3>
+<div class="spec">
+<p><code>reschedule_update(Pid::pid(), DelayMs::pos_integer(), Reason::binary()) -&gt; ok</code><br></p>
+<p> </p>
+</div><p>Not now: ask NervesHub to offer the update again in <code>DelayMs</code>.</p>
 
 <h3 class="function"><a name="send_log-3">send_log/3</a></h3>
 <div class="spec">
@@ -244,6 +317,18 @@ with no keys installs what NervesHub sent it.</p>
   <code>{error, no_clock}</code> when the device's clock has never been set: NervesHub
   requires a timestamp and drops a line without one, and a line dated 1970 is
   worse than no line. See <code>nh_ext_logs</code>.</p>
+
+<h3 class="function"><a name="set_update_mode-2">set_update_mode/2</a></h3>
+<div class="spec">
+<p><code>set_update_mode(Pid::pid(), Mode::automatic | device_managed) -&gt; {ok, <a href="#type-update_mode" docgen-rel="seetype" docgen-href="#update_mode/0">update_mode()</a>} | {error, term()}</code><br></p>
+<p> </p>
+</div><p><p>Choose who decides when this device updates.</p>
+ 
+  <code>automatic</code> is NervesHub's deployments pushing updates as they always have.
+  <code>device_managed</code> stops the pushes and leaves it to <code>request_update/1</code>. A
+  device may only switch to <code>device_managed</code> when its product allows it, and
+  NervesHub answers <code>{error, not_permitted}</code> otherwise. Setting <code>off</code> is
+  reserved for an operator.</p>
 
 <h3 class="function"><a name="start-1">start/1</a></h3>
 <div class="spec">
@@ -268,6 +353,16 @@ with no keys installs what NervesHub sent it.</p>
 <p><code>update_failed(Pid::pid(), Reason::binary()) -&gt; ok</code><br></p>
 <p> </p>
 </div><p>Report that an update did not complete.</p>
+
+<h3 class="function"><a name="update_mode-1">update_mode/1</a></h3>
+<div class="spec">
+<p><code>update_mode(Pid::pid()) -&gt; {ok, <a href="#type-update_mode" docgen-rel="seetype" docgen-href="#update_mode/0">update_mode()</a>} | {error, term()}</code><br></p>
+<p> </p>
+</div><p><p>The update mode NervesHub last reported, without asking it again.</p>
+ 
+  NervesHub reports it after every join and whenever it changes, and each
+  report also reaches the handler as <code>{update_mode, Mode, ManagedAllowed}</code>.
+  <code>{error, unknown}</code> until the first one arrives.</p>
 
 <h3 class="function"><a name="update_progress-2">update_progress/2</a></h3>
 <div class="spec">

@@ -5,7 +5,12 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-all_enabled() -> nh_extensions:new(#{extensions => all}).
+all_enabled() -> offered(#{extensions => all}).
+
+%% Offered with no advert, as to a server that never sent `extensions:get'.
+offered(Config) ->
+    {State, _Payload} = nh_extensions:offer(undefined, nh_extensions:new(Config)),
+    State.
 
 attached_all() ->
     {State, _Actions} = nh_extensions:attach(
@@ -49,7 +54,7 @@ attach_uses_the_join_reply_test() ->
 %% start answering for it.
 attach_ignores_what_was_never_offered_test() ->
     {State, _Actions} = nh_extensions:attach(
-        [<<"health">>, <<"local_shell">>], nh_extensions:new(#{extensions => [health]})
+        [<<"health">>, <<"local_shell">>], offered(#{extensions => [health]})
     ),
     ?assertEqual([<<"health">>], nh_extensions:attached(State)).
 
@@ -111,3 +116,65 @@ attach_confirms_each_extension_test() ->
 nothing_is_confirmed_that_was_not_attached_test() ->
     {_State, Actions} = nh_extensions:attach([<<"local_shell">>], all_enabled()),
     ?assertEqual([], Actions).
+
+%% ------------------------------------------------------------ negotiation
+
+advert(Map) -> #{<<"extensions">> => Map}.
+
+the_newest_version_both_speak_is_offered_test() ->
+    {_State, Offer} = nh_extensions:offer(
+        advert(#{<<"logging">> => [<<"0.2.0">>, <<"0.1.0">>, <<"0.0.1">>]}),
+        nh_extensions:new(#{extensions => [logging]})
+    ),
+    ?assertEqual(#{<<"logging">> => <<"0.1.0">>}, Offer).
+
+an_older_server_gets_the_older_version_test() ->
+    {State, Offer} = nh_extensions:offer(
+        advert(#{<<"logging">> => [<<"0.0.1">>]}), nh_extensions:new(#{extensions => [logging]})
+    ),
+    ?assertEqual(#{<<"logging">> => <<"0.0.1">>}, Offer),
+    ?assertEqual(<<"0.0.1">>, nh_extensions:version(<<"logging">>, State)).
+
+what_the_server_does_not_advertise_is_not_offered_test() ->
+    {_State, Offer} = nh_extensions:offer(
+        advert(#{<<"health">> => [<<"0.0.1">>]}), nh_extensions:new(#{extensions => all})
+    ),
+    ?assertEqual(#{<<"health">> => <<"0.0.1">>}, Offer).
+
+no_version_in_common_is_not_offered_test() ->
+    {_State, Offer} = nh_extensions:offer(
+        advert(#{<<"health">> => [<<"9.0.0">>]}), nh_extensions:new(#{extensions => [health]})
+    ),
+    ?assertEqual(#{}, Offer).
+
+%% ------------------------------------------------------------- lifecycle
+
+attach_all_means_everything_offered_test() ->
+    {State0, _} = nh_extensions:attach([], all_enabled()),
+    {State, Actions} = nh_extensions:handle_event(
+        <<"attach">>, #{<<"extensions">> => <<"all">>}, State0
+    ),
+    ?assertEqual(
+        [<<"geo">>, <<"health">>, <<"logging">>], lists:sort(nh_extensions:attached(State))
+    ),
+    ?assertEqual(3, length(Actions)).
+
+detach_confirms_and_stops_test() ->
+    {State, Actions} = nh_extensions:handle_event(
+        <<"detach">>, #{<<"extensions">> => [<<"geo">>]}, attached_all()
+    ),
+    ?assertEqual([{push, <<"geo:detached">>, #{}}], Actions),
+    ?assertNot(nh_extensions:is_attached(<<"geo">>, State)).
+
+detaching_what_is_not_attached_says_nothing_test() ->
+    {State0, _} = nh_extensions:attach([<<"health">>], all_enabled()),
+    ?assertMatch(
+        {_, []},
+        nh_extensions:handle_event(<<"detach">>, #{<<"extensions">> => [<<"geo">>]}, State0)
+    ).
+
+disconnecting_detaches_everything_test() ->
+    State = nh_extensions:disconnected(attached_all()),
+    ?assertEqual([], nh_extensions:attached(State)),
+    ?assertEqual(undefined, nh_extensions:version(<<"health">>, State)),
+    ?assertEqual([<<"health">>, <<"geo">>, <<"logging">>], nh_extensions:enabled(State)).

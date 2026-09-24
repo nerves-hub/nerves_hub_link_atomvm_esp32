@@ -36,6 +36,7 @@
 -module(nh_console).
 
 -export([new/0, banner/0, prompt/0, handle_input/2, restart/1, parse/1, commands/0]).
+-export([run_command/1]).
 
 %% Terminals want CRLF, and NervesHub replays exactly what it is sent.
 -define(EOL, <<"\r\n">>).
@@ -195,6 +196,26 @@ run(Line) ->
     case parse(Line) of
         empty -> <<>>;
         {Command, Args} -> execute(Command, Args)
+    end.
+
+%%-----------------------------------------------------------------------------
+%% @doc Run one command line, saying whether it was a command at all.
+%%
+%% The console only prints, so it does not care. A script does: a line that is
+%% not a command is a script that did not do what it says, and NervesHub should
+%% hear that it failed rather than that it completed.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec run_command(binary()) -> {ok, binary()} | {error, binary()}.
+run_command(Line) ->
+    case parse(Line) of
+        empty ->
+            {ok, <<>>};
+        {Command, Args} ->
+            case lists:keymember(Command, 1, commands()) of
+                true -> {ok, execute(Command, Args)};
+                false -> {error, execute(Command, Args)}
+            end
     end.
 
 execute(<<"help">>, _Args) ->
