@@ -40,6 +40,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSON-encoded in the agent, which on AtomVM costs the process many times the
   output's size in heap: a 2 KB answer with quotes in it took more than an
   ESP32 without PSRAM had in one block, and the device panicked.
+- `nerves_hub_link:flush_logs/2` sends the log lines waiting for a batch, for
+  an application about to restart the device on purpose.
+
+### Changed
+
+- Log lines no longer wait for the batch timer when the device may be about
+  to go down: a line at `error` or worse, and any line while an update
+  downloads, is sent at once, and a `reboot` sends what is waiting first. A
+  batch still waiting went with a panic.
 
 ## [0.2.0] - 2026-09-24
 
