@@ -177,6 +177,17 @@ surfaces_join_and_messages_test() ->
 
     nh_agent:stop(Agent).
 
+%% Pings are the transport's business; the agent only passes the interval on.
+passes_the_ping_interval_to_the_transport_test() ->
+    setup(),
+    {ok, Default} = nh_agent:start(config(#{})),
+    ?assertNot(maps:is_key(ping_interval_ms, next_opened())),
+    nh_agent:stop(Default),
+
+    {ok, Agent} = nh_agent:start(config(#{ping_interval_ms => 60000})),
+    ?assertEqual(60000, maps:get(ping_interval_ms, next_opened())),
+    nh_agent:stop(Agent).
+
 %% ------------------------------------------------------------------- helpers
 
 next_opened() ->

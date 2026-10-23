@@ -5,6 +5,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,
+  passed to the transport. ESP-IDF's default is every 10 seconds, which on a
+  metered link (a cellular modem, say) costs more than the heartbeats;
+  NervesHub needs only the heartbeats to keep the socket.
+
 ## [0.2.0] - 2026-09-24
 
 Upgrading changes what a device does by default. **Changed** lists what to

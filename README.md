@@ -208,6 +208,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `network_interface` | `<<"wlan0">>` | What the device reports it connects over |
 | `log_flush_ms` | 10000 | How long batched log lines wait |
 | `log_buffer` | 100 | Log lines held before the oldest are dropped |
+| `ping_interval_ms` | the transport's | WebSocket pings; the IDF's are every 10 s |
 | `transport` | `websocket_client` | |
 
 ## Updates
