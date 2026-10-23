@@ -32,7 +32,9 @@
 %%-----------------------------------------------------------------------------
 -module(nh_ext_logs).
 
--export([line/2, line/3, line_at/4, event/0, batch/1, dropped_line/1, max_batch/0]).
+-export([
+    line/2, line/3, line_at/4, event/0, batch/1, dropped_line/1, max_batch/0, max_batch_bytes/0
+]).
 
 %% Anything below the epoch-plus-a-few-decades is a clock that was never set.
 -define(EARLIEST_PLAUSIBLE_TIME, 1700000000).
@@ -40,6 +42,14 @@
 %% NervesHub takes at most this many lines in one batched message and replaces
 %% the rest with a warning, so a batch is never built bigger.
 -define(MAX_BATCH, 100).
+
+%% A batch is encoded in one go, in the agent's process, and the moment it is
+%% biggest is right after a rejoin, when the lines held through the outage go
+%% out on a connection whose TLS handshake has just taken its share of the heap.
+%% A hundred lines of a few hundred bytes each ran a board without PSRAM out of
+%% memory there, so a batch also stops at this many bytes of messages and the
+%% rest waits for the next flush.
+-define(MAX_BATCH_BYTES, 4096).
 
 %% NervesHub truncates a message longer than this, and on an ESP32 a line that
 %% long is more likely a runaway `~p' than something worth the heap.
@@ -73,6 +83,13 @@ batch(Lines) -> #{<<"lines">> => Lines}.
 %%-----------------------------------------------------------------------------
 -spec max_batch() -> pos_integer().
 max_batch() -> ?MAX_BATCH.
+
+%%-----------------------------------------------------------------------------
+%% @doc The most message bytes one batch may carry, past its first line.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec max_batch_bytes() -> pos_integer().
+max_batch_bytes() -> ?MAX_BATCH_BYTES.
 
 %%-----------------------------------------------------------------------------
 %% @doc A line saying that `Count' lines were dropped to make room.

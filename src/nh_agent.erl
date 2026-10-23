@@ -955,7 +955,9 @@ flush_logs(State0) ->
         true ->
             case logging_mode(State) of
                 batched ->
-                    {Lines, Rest} = nh_log_buffer:take(nh_ext_logs:max_batch(), Buffer),
+                    {Lines, Rest} = nh_log_buffer:take(
+                        nh_ext_logs:max_batch(), nh_ext_logs:max_batch_bytes(), Buffer
+                    ),
                     State1 = push_extension(
                         nh_ext_logs:event(), nh_ext_logs:batch(Lines), State#{log_buffer => Rest}
                     ),

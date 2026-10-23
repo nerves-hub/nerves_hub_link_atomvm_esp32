@@ -554,6 +554,21 @@ a_full_batch_goes_at_once_test() ->
 
     nh_agent:stop(Agent).
 
+%% Long lines go in more than one batch, the rest at the next flush.
+a_batch_stops_at_its_byte_limit_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 200}, [<<"logging">>], advert()
+    ),
+
+    Long = binary:copy(<<"x">>, nh_ext_logs:max_batch_bytes() div 2 + 1),
+    [ok = nerves_hub_link:send_log(Agent, <<"info">>, Long) || _ <- [1, 2, 3]],
+    #{<<"lines">> := First} = wait_for_event(<<"logging:send">>, 2000),
+    #{<<"lines">> := Second} = wait_for_event(<<"logging:send">>, 2000),
+    #{<<"lines">> := Third} = wait_for_event(<<"logging:send">>, 2000),
+    ?assertEqual([1, 1, 1], [length(First), length(Second), length(Third)]),
+
+    nh_agent:stop(Agent).
+
 %% ------------------------------------------------------------------ actions
 
 send_device(Agent, JoinRef, Event) ->

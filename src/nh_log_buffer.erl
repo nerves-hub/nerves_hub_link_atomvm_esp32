@@ -16,7 +16,7 @@
 %%-----------------------------------------------------------------------------
 -module(nh_log_buffer).
 
--export([new/1, add/2, take/2, size/1, dropped/1]).
+-export([new/1, add/2, take/2, take/3, size/1, dropped/1]).
 
 -opaque buffer() :: #{
     lines := queue:queue(map()),
@@ -51,18 +51,47 @@ add(Line, #{lines := Lines, dropped := Dropped} = Buffer) ->
 %% @end
 %%-----------------------------------------------------------------------------
 -spec take(pos_integer(), buffer()) -> {[map()], buffer()}.
-take(N, #{dropped := Dropped} = Buffer) when Dropped > 0 ->
+take(N, Buffer) -> take(N, infinity, Buffer).
+
+%%-----------------------------------------------------------------------------
+%% @doc Take up to `N' lines, oldest first, stopping before their messages
+%% add up to more than `MaxBytes'.
+%%
+%% The first line is always taken, however long, so a single big line cannot
+%% hold up the buffer forever. The drop notice counts towards `N' as in
+%% `take/2', and not towards `MaxBytes': it is short, and it goes first.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec take(pos_integer(), pos_integer() | infinity, buffer()) -> {[map()], buffer()}.
+take(N, MaxBytes, #{dropped := Dropped} = Buffer) when Dropped > 0 ->
     case nh_ext_logs:dropped_line(Dropped) of
         {ok, Notice} ->
-            {Lines, Rest} = take(N - 1, Buffer#{dropped => 0}),
+            {Lines, Rest} = take(N - 1, MaxBytes, Buffer#{dropped => 0}),
             {[Notice | Lines], Rest};
         {error, no_clock} ->
-            take(N, Buffer#{dropped => 0})
+            take(N, MaxBytes, Buffer#{dropped => 0})
     end;
-take(N, #{lines := Lines, count := Count} = Buffer) ->
-    Taken = min(N, Count),
-    {Front, Back} = queue:split(Taken, Lines),
-    {queue:to_list(Front), Buffer#{lines => Back, count => Count - Taken}}.
+take(N, MaxBytes, #{lines := Lines, count := Count} = Buffer) ->
+    {Taken, Back} = take_lines(min(N, Count), MaxBytes, Lines, []),
+    {Taken, Buffer#{lines => Back, count => Count - length(Taken)}}.
+
+%% Up to `N' lines from the front of `Lines', in order, and the queue left.
+-spec take_lines(non_neg_integer(), pos_integer() | infinity, queue:queue(map()), [map()]) ->
+    {[map()], queue:queue(map())}.
+take_lines(0, _MaxBytes, Lines, Acc) ->
+    {lists:reverse(Acc), Lines};
+take_lines(N, MaxBytes, Lines, Acc) ->
+    {value, Line} = queue:peek(Lines),
+    Bytes = message_bytes(Line),
+    case Acc =:= [] orelse Bytes =< MaxBytes of
+        true -> take_lines(N - 1, budget(MaxBytes, Bytes), queue:drop(Lines), [Line | Acc]);
+        false -> {lists:reverse(Acc), Lines}
+    end.
+
+budget(infinity, _Bytes) -> infinity;
+budget(MaxBytes, Bytes) -> max(MaxBytes - Bytes, 0).
+
+message_bytes(Line) -> byte_size(maps:get(<<"message">>, Line, <<>>)).
 
 %%-----------------------------------------------------------------------------
 %% @doc Lines waiting, not counting a pending drop notice.
