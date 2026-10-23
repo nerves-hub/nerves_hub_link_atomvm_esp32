@@ -31,7 +31,7 @@
 %%-----------------------------------------------------------------------------
 -module(nh_ext_health).
 
--export([report/0, metrics/0, metadata/0, timestamp/0]).
+-export([report/0, report/1, metrics/0, metadata/0, timestamp/0]).
 
 %%-----------------------------------------------------------------------------
 %% @doc The full report NervesHub stores against the device.
@@ -39,13 +39,31 @@
 %%-----------------------------------------------------------------------------
 -spec report() -> map().
 report() ->
-    #{
+    report(#{}).
+
+%%-----------------------------------------------------------------------------
+%% @doc The report, carrying the application's current alarms.
+%%
+%% `#{Name => Description}', both binaries: the complete set raised right now.
+%% NervesHub diffs it against what it has stored, so an alarm missing from a
+%% report is an alarm cleared.
+%%
+%% `undefined' leaves the key out, which NervesHub reads as "nothing to say":
+%% the report of a device sending its alarms through the `alarms' extension.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec report(map() | undefined) -> map().
+report(Alarms) ->
+    Report = #{
         <<"timestamp">> => timestamp(),
         <<"metadata">> => metadata(),
-        <<"alarms">> => #{},
         <<"metrics">> => metrics(),
         <<"checks">> => #{}
-    }.
+    },
+    case Alarms of
+        undefined -> Report;
+        _ -> Report#{<<"alarms">> => Alarms}
+    end.
 
 %%-----------------------------------------------------------------------------
 %% @doc Numbers that change, and are worth a graph.
