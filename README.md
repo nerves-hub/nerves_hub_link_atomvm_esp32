@@ -137,6 +137,7 @@ The calling process receives `{nerves_hub, Event}`:
 | `{join_error, Reason}` | The server refused the join |
 | `{message, Event, Payload}` | A server message this library does not handle itself |
 | `{update_started, Pid}` | An update is downloading |
+| `{download_socket, open \| closed, Largest}` | With `keep_open_above`: whether the socket stays open for the download |
 | `{download_resumed, Offset}` | The download reconnected and asked for the rest from `Offset` |
 | `{update_ready, Slot}` | Written and armed; reboot when convenient |
 | `{update_failed, Reason}` | Refused, or the write failed |
@@ -212,6 +213,8 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `ping_interval_ms` | 60000 | WebSocket pings; the IDF on its own sends them every 10 s |
 | `download_resume_after_ms` | 10000 | How long a download connection may stay quiet before it is resumed. See [updates](#updates) |
 | `download_resumes` | 3 | Download connections in a row that bring nothing before giving up |
+| `keep_open_above` | unset: open | Close the socket while an update downloads unless this many bytes are free in one block, or `never` to always close. See [updates](#updates) |
+| `before_update` | none | A function run before a download starts, to free memory |
 | `transport` | `websocket_client` | |
 
 ## Updates
@@ -228,6 +231,16 @@ the device running what it had.
 NervesHub hears how it goes as it goes: `received` when the update is accepted,
 `started` as each download connection begins, progress while it downloads,
 `completed` once it is armed, and `failed` with a reason if it is not.
+
+An ESP32 without PSRAM may have room for one TLS session, not two: with the
+socket open, the download's handshake can leave too little heap for the next
+record on either connection, and the device aborts. `keep_open_above => Bytes`
+closes the socket while an update downloads, unless the largest free block of
+heap is at least `Bytes` as the download starts, and reopens it afterwards;
+`never` always closes it. The owner hears `{download_socket, open | closed,
+LargestFreeBlock}`, and what NervesHub would have heard while the socket was
+closed is sent, in order, once the device has joined again. `before_update`
+runs before any of this, so the application can free memory of its own first.
 
 A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
 short is dropped, and the rest is asked for from the last byte received with a

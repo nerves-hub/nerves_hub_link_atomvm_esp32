@@ -186,6 +186,13 @@
 %% `{update_ready, Slot}' when it is armed. Rebooting is left to the
 %% application. `updates => manual' reports the message and does nothing else.
 %%
+%% An ESP32 without PSRAM may not have the heap for the download's TLS session
+%% next to the socket's. `keep_open_above => Bytes' closes the socket while an
+%% update downloads unless the largest free block is at least `Bytes' as the
+%% download starts, and `never' closes it whatever the heap; without it the
+%% socket stays open. See `nh_agent'. `before_update => Fun' runs first, to
+%% free memory for the download (the application's own TLS connections, say).
+%%
 %% == Firmware description ==
 %%
 %% `firmware' says where the running firmware's description comes from:
@@ -247,6 +254,8 @@
     handler => pid(),
     heartbeat_ms => pos_integer(),
     ping_interval_ms => pos_integer(),
+    keep_open_above => non_neg_integer() | never,
+    before_update => fun(() -> ok),
     transport => module()
 }.
 
