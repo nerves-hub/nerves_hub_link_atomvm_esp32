@@ -40,8 +40,14 @@ unknown_extensions_are_dropped_test() ->
 
 available_declares_a_version_per_extension_test() ->
     Available = nh_extensions:available(all_enabled()),
-    ?assertEqual([<<"geo">>, <<"health">>, <<"logging">>], lists:sort(maps:keys(Available))),
-    lists:foreach(fun(V) -> ?assertEqual(<<"0.0.1">>, V) end, maps:values(Available)).
+    ?assertEqual(
+        [<<"alarms">>, <<"geo">>, <<"health">>, <<"logging">>], lists:sort(maps:keys(Available))
+    ),
+    ?assertEqual(<<"0.1.0">>, maps:get(<<"alarms">>, Available)),
+    lists:foreach(
+        fun(V) -> ?assertEqual(<<"0.0.1">>, V) end,
+        maps:values(maps:remove(<<"alarms">>, Available))
+    ).
 
 %% The platform decides what is on; a product may have an extension switched off.
 attach_uses_the_join_reply_test() ->
@@ -155,9 +161,10 @@ attach_all_means_everything_offered_test() ->
         <<"attach">>, #{<<"extensions">> => <<"all">>}, State0
     ),
     ?assertEqual(
-        [<<"geo">>, <<"health">>, <<"logging">>], lists:sort(nh_extensions:attached(State))
+        [<<"alarms">>, <<"geo">>, <<"health">>, <<"logging">>],
+        lists:sort(nh_extensions:attached(State))
     ),
-    ?assertEqual(3, length(Actions)).
+    ?assertEqual(4, length(Actions)).
 
 detach_confirms_and_stops_test() ->
     {State, Actions} = nh_extensions:handle_event(
@@ -177,4 +184,93 @@ disconnecting_detaches_everything_test() ->
     State = nh_extensions:disconnected(attached_all()),
     ?assertEqual([], nh_extensions:attached(State)),
     ?assertEqual(undefined, nh_extensions:version(<<"health">>, State)),
-    ?assertEqual([<<"health">>, <<"geo">>, <<"logging">>], nh_extensions:enabled(State)).
+    ?assertEqual(
+        [<<"health">>, <<"geo">>, <<"logging">>, <<"alarms">>], nh_extensions:enabled(State)
+    ).
+
+%% ------------------------------------------------------------------- alarms
+
+with_alarms(Extensions, Fun) ->
+    nh_extensions:new(#{extensions => Extensions, alarms => Fun}).
+
+attached(Names, State) ->
+    {Offered, _} = nh_extensions:offer(undefined, State),
+    {Attached, _} = nh_extensions:attach(Names, Offered),
+    Attached.
+
+low_memory() -> #{<<"LowMemory">> => <<"low">>}.
+
+alarms_is_polled_only_when_enabled_with_a_fun_test() ->
+    ?assert(nh_extensions:polls_alarms(with_alarms([alarms], fun() -> #{} end))),
+    ?assert(nh_extensions:polls_alarms(with_alarms([alarms], fun(_) -> #{} end))),
+    ?assertNot(nh_extensions:polls_alarms(with_alarms([health], fun() -> #{} end))),
+    ?assertNot(nh_extensions:polls_alarms(nh_extensions:new(#{extensions => [alarms]}))).
+
+a_poll_pushes_what_changed_test() ->
+    State = attached([<<"alarms">>], with_alarms([alarms], fun low_memory/0)),
+    {State1, Actions} = nh_extensions:poll_alarms(State),
+    ?assertMatch([{push, <<"alarms:raised">>, #{<<"alarm">> := <<"LowMemory">>}}], Actions),
+    ?assertEqual({State1, []}, nh_extensions:poll_alarms(State1)).
+
+%% Followed while detached, so a later snapshot has the time it was raised.
+a_poll_while_detached_follows_without_pushing_test() ->
+    {State, Actions} = nh_extensions:poll_alarms(with_alarms([alarms], fun low_memory/0)),
+    ?assertEqual([], Actions),
+    {_, [{push, <<"alarms:snapshot">>, #{<<"alarms">> := [Entry]}}]} =
+        nh_extensions:handle_event(<<"alarms:sync">>, #{}, attached([<<"alarms">>], State)),
+    ?assertMatch(#{<<"alarm">> := <<"LowMemory">>}, Entry).
+
+%% A one-argument fun hears what it said last time: hysteresis without state.
+a_fun_of_one_is_given_the_previous_set_test() ->
+    Self = self(),
+    Fun = fun(Previous) ->
+        Self ! {previous, Previous},
+        low_memory()
+    end,
+    {State, _} = nh_extensions:poll_alarms(with_alarms([alarms], Fun)),
+    {_, _} = nh_extensions:poll_alarms(State),
+    ?assertEqual([#{}, low_memory()], [
+        receive
+            {previous, P} -> P
+        end
+     || _ <- [1, 2]
+    ]).
+
+%% What was raised stays raised: a broken callback is not a cleared alarm.
+a_failing_fun_changes_nothing_test() ->
+    Key = {?MODULE, fail},
+    persistent_term:put(Key, false),
+    Fun = fun() ->
+        case persistent_term:get(Key) of
+            true -> error(boom);
+            false -> low_memory()
+        end
+    end,
+    State = attached([<<"alarms">>, <<"health">>], with_alarms([alarms, health], Fun)),
+    {State1, _} = nh_extensions:poll_alarms(State),
+    persistent_term:put(Key, true),
+    ?assertEqual({State1, []}, nh_extensions:poll_alarms(State1)),
+    persistent_term:erase(Key).
+
+sync_answers_with_a_snapshot_and_no_events_test() ->
+    State = attached([<<"alarms">>], with_alarms([alarms], fun low_memory/0)),
+    {_, Actions} = nh_extensions:handle_event(<<"alarms:sync">>, #{}, State),
+    ?assertMatch([{push, <<"alarms:snapshot">>, #{<<"alarms">> := [_]}}], Actions).
+
+%% An absent key leaves what the alarms extension stored; `#{}' would clear it.
+the_health_report_leaves_alarms_out_when_alarms_is_attached_test() ->
+    State = attached([<<"alarms">>, <<"health">>], with_alarms([alarms, health], fun low_memory/0)),
+    {_, Actions} = nh_extensions:handle_event(<<"health:check">>, #{}, State),
+    [{push, <<"health:report">>, #{<<"value">> := Report}}] =
+        [A || {push, <<"health:report">>, _} = A <- Actions],
+    ?assertNot(maps:is_key(<<"alarms">>, Report)),
+    ?assertMatch(
+        [{push, <<"alarms:raised">>, _}],
+        Actions -- [{push, <<"health:report">>, #{<<"value">> => Report}}]
+    ).
+
+the_health_report_carries_alarms_without_the_extension_test() ->
+    State = attached([<<"health">>], with_alarms([health], fun low_memory/0)),
+    {_, [{push, <<"health:report">>, #{<<"value">> := Report}}]} =
+        nh_extensions:handle_event(<<"health:check">>, #{}, State),
+    ?assertEqual(low_memory(), maps:get(<<"alarms">>, Report)).

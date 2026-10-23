@@ -354,8 +354,9 @@ restart the device every time it connected.
 
 ## Extensions
 
-`extensions => all` attaches the three NervesHub extensions: `health` reports
-memory and uptime, `geo` reports a location, and `logging` carries log lines.
+`extensions => all` attaches the four NervesHub extensions: `health` reports
+memory and uptime, `geo` reports a location, `logging` carries log lines, and
+`alarms` sends the application's alarms as they are raised and cleared.
 
 After the device joins, NervesHub says which versions of each it speaks and the
 device joins with the newest both know. An operator can turn one off or on
@@ -394,6 +395,30 @@ leader, so `io:format/2`, `IO.puts/1` and `IO.inspect/1` reach NervesHub as well
 as the console. Read `nh_io_capture` before turning it on: the failure mode of a
 group leader is a printing process that waits forever, and there is one
 interaction with `logger_std_h` that duplicates every logged line.
+
+### Alarms
+
+`alarms => Fun` returns the complete set raised right now, `#{Name =>
+Description}`. Without the `alarms` extension it goes on the health report,
+which NervesHub asks for hourly on an idle device. With it, the agent calls
+`Fun` every `alarms_interval_ms` (30 s by default) and sends only what changed,
+stamped with the time the alarm appeared; `nh_ext_alarms` has the details.
+
+A `Fun` of one argument is given what it returned last time, so an alarm can
+clear at a different level from the one that raised it:
+
+```erlang
+alarms => fun(Raised) ->
+    Block = erlang:system_info(esp32_largest_free_block),
+    Limit = case maps:is_key(<<"LowMemory">>, Raised) of true -> 36000; false -> 32768 end,
+    case Block < Limit of
+        true -> #{<<"LowMemory">> => <<"heap fragmented">>};
+        false -> #{}
+    end
+end
+```
+
+Keep descriptions stable: a new description is sent as the alarm raised again.
 
 ## Describing the firmware
 

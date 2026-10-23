@@ -46,6 +46,13 @@
 %% concern would not work: a steady stream of incoming messages would keep
 %% pushing every timeout out, and a device would stop heartbeating while it
 %% looked busy and healthy.
+%%
+%% == Alarms ==
+%%
+%% With the `alarms' extension enabled and an `alarms => Fun', the agent asks
+%% the application for its alarms every `alarms_interval_ms' (30 s by default)
+%% and sends what changed; see `nh_ext_alarms'. It keeps asking while offline,
+%% so an alarm raised then keeps the time it was raised.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_agent).
@@ -91,6 +98,8 @@
 %% Replies to extension pushes are matched by reference; this many are kept.
 -define(EXT_REFS_KEPT, 16).
 
+-define(DEFAULT_ALARMS_INTERVAL_MS, 30000).
+
 -type config() :: #{
     url => binary() | string(),
     host => binary() | string(),
@@ -106,7 +115,8 @@
     network_interface => binary(),
     firmware_trial => #{boot_attempts => pos_integer(), join_timeout_ms => pos_integer()} | off,
     log_flush_ms => pos_integer(),
-    log_buffer => pos_integer()
+    log_buffer => pos_integer(),
+    alarms_interval_ms => pos_integer()
 }.
 
 -export_type([config/0]).
@@ -182,7 +192,7 @@ init(Config, Owner) ->
         timers => #{}
     },
 
-    State1 = begin_trial(State0),
+    State1 = schedule_alarms(begin_trial(State0)),
     Channel = maybe_add_extensions(
         maybe_add_console(nh_channel:new(join_params(State1)), Config), Extensions
     ),
@@ -331,6 +341,9 @@ fire(trial_deadline, State) ->
     trial_expired(State);
 fire(update_idle, State) ->
     update_stalled(State);
+fire(poll_alarms, State) ->
+    {Extensions, Actions} = nh_extensions:poll_alarms(maps:get(extensions, State)),
+    schedule_alarms(run_extension_actions(Actions, State#{extensions => Extensions}));
 fire({request, Kind}, State) ->
     reply_request(Kind, {error, timeout}, State);
 fire({script, Ref}, State) ->
@@ -854,6 +867,15 @@ join_extensions(Advert, State0) ->
                     ),
                     run(Actions, State1#{channel => Channel})
             end
+    end.
+
+schedule_alarms(#{config := Config, extensions := Extensions} = State) ->
+    case nh_extensions:polls_alarms(Extensions) of
+        true ->
+            Ms = maps:get(alarms_interval_ms, Config, ?DEFAULT_ALARMS_INTERVAL_MS),
+            set_timer(poll_alarms, Ms, State);
+        false ->
+            State
     end.
 
 run_extension_actions(Actions, State) ->

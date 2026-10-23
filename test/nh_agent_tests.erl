@@ -495,6 +495,23 @@ a_health_check_is_answered_with_a_report_test() ->
 
     nh_agent:stop(Agent).
 
+%% The health report carries what the application says is raised, and a
+%% callback that fails or answers nonsense reports nothing raised.
+a_report_carries_the_applications_alarms_test() ->
+    Alarms = #{<<"LowMemory">> => <<"largest free block 20000 bytes">>},
+    lists:foreach(
+        fun({Fun, Expected}) ->
+            {Agent, Ref, _} = join_with_extensions(
+                #{extensions => [health], alarms => Fun}, [<<"health">>], advert()
+            ),
+            send_extension(Agent, Ref, <<"health:check">>, #{}),
+            Payload = wait_for_event(<<"health:report">>, 2000),
+            ?assertEqual(Expected, maps:get(<<"alarms">>, maps:get(<<"value">>, Payload))),
+            nh_agent:stop(Agent)
+        end,
+        [{fun() -> Alarms end, Alarms}, {fun() -> error(boom) end, #{}}, {fun() -> nope end, #{}}]
+    ).
+
 %% The platform asking for something it never turned on is not answered.
 a_check_for_a_detached_extension_is_ignored_test() ->
     {Agent, Ref, _} = join_with_extensions([health, geo], [<<"geo">>]),
