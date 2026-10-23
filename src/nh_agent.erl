@@ -605,7 +605,8 @@ update_decision({reschedule, DelayMs, Reason}, State) ->
 
 start_update(Payload, State0) ->
     State = status_update(<<"received">>, #{}, State0),
-    Pid = nh_ota:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
+    Updater = maps:get(updater, maps:get(config, State), nh_ota),
+    Pid = Updater:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
     notify(State, {update_started, Pid}),
     download_alive(State#{update => Pid}).
 
@@ -673,6 +674,12 @@ process_down(_Pid, _Reason, State) ->
 call(update_mode, From, Tag, State) ->
     reply(From, Tag, update_mode_reply(maps:get(update_mode, State))),
     State;
+%% Before the application restarts the device on purpose: what it logged on the
+%% way down is the line that says why.
+call(flush_logs, From, Tag, State) ->
+    State1 = flush_all_logs(State),
+    reply(From, Tag, ok),
+    State1;
 call(Request, From, Tag, State) ->
     Kind = request_kind(Request),
     Requests = maps:get(requests, State),
@@ -906,7 +913,7 @@ extension_out(<<"logging:send">>, Line, State) ->
                     push_extension(nh_ext_logs:event(), Line, State);
                 batched ->
                     Buffer = nh_log_buffer:add(Line, maps:get(log_buffer, State)),
-                    maybe_flush_logs(State#{log_buffer => Buffer})
+                    maybe_flush_logs(Line, State#{log_buffer => Buffer})
             end
     end;
 extension_out(Event, Payload, State) ->
@@ -925,11 +932,29 @@ logging_mode(State) ->
     end.
 
 %% A full batch goes now; anything less waits for the flush timer, so a chatty
-%% moment costs one message rather than one per line.
-maybe_flush_logs(State) ->
-    case nh_log_buffer:size(maps:get(log_buffer, State)) >= nh_ext_logs:max_batch() of
+%% moment costs one message rather than one per line. Except when the next
+%% thing may be the device going down, taking the batch with it: an error, or a
+%% download, which is when a board without PSRAM runs out of memory.
+maybe_flush_logs(Line, State) ->
+    Full = nh_log_buffer:size(maps:get(log_buffer, State)) >= nh_ext_logs:max_batch(),
+    case Full orelse urgent(Line) orelse is_map_key(update, State) of
         true -> flush_logs(State);
         false -> arm_log_flush(State)
+    end.
+
+urgent(#{<<"level">> := Level}) ->
+    lists:member(Level, [<<"error">>, <<"critical">>, <<"alert">>, <<"emergency">>]);
+urgent(_Line) ->
+    false.
+
+%% Everything waiting, not just one batch.
+flush_all_logs(State) ->
+    Before = nh_log_buffer:size(maps:get(log_buffer, State)),
+    State1 = flush_logs(State),
+    case nh_log_buffer:size(maps:get(log_buffer, State1)) of
+        0 -> State1;
+        Before -> State1;
+        _Fewer -> flush_all_logs(State1)
     end.
 
 arm_log_flush(#{timers := Timers, config := Config} = State) ->
@@ -1003,7 +1028,8 @@ console_out(Output, State) ->
 %% once the frame is handed to the socket, not once it leaves, and `esp:restart/0'
 %% is immediate -- so without a pause the platform never learns why the device
 %% vanished. The same gap swallowed the update messages on the ESP-IDF agent.
-reboot(State) ->
+reboot(State0) ->
+    State = flush_all_logs(State0),
     _ = timer:sleep(?REBOOT_GRACE_MS),
     _ =
         try

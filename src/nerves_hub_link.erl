@@ -218,6 +218,7 @@
 -export([push/3]).
 -export([send_log/3, send_log/4]).
 -export([check_for_update/1, request_update/1, set_update_mode/2, update_mode/1]).
+-export([flush_logs/2]).
 -export([apply_update/2, ignore_update/2, reschedule_update/3]).
 
 -type firmware_source() :: boot | {partition, binary()} | {metadata, map()} | none.
@@ -430,6 +431,37 @@ ignore_update(Pid, Reason) when is_binary(Reason) ->
 reschedule_update(Pid, DelayMs, Reason) when is_integer(DelayMs), DelayMs > 0, is_binary(Reason) ->
     Pid ! {update_decision, {reschedule, DelayMs, Reason}},
     ok.
+
+%%-----------------------------------------------------------------------------
+%% @doc Send the log lines waiting for a batch now, and wait for them to be
+%% handed to the socket, for up to `TimeoutMs'.
+%%
+%% For an application about to restart the device on purpose: the lines it
+%% logged on the way down say why, and a batch still waiting would go with it.
+%% Lines at `error' or worse, and lines logged while an update downloads, are
+%% sent at once anyway.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec flush_logs(pid() | atom(), non_neg_integer()) -> ok | {error, term()}.
+flush_logs(Name, TimeoutMs) when is_atom(Name) ->
+    case whereis(Name) of
+        undefined -> {error, no_agent};
+        Pid -> flush_logs(Pid, TimeoutMs)
+    end;
+flush_logs(Pid, TimeoutMs) ->
+    Monitor = erlang:monitor(process, Pid),
+    Tag = make_ref(),
+    Pid ! {call, self(), Tag, flush_logs},
+    receive
+        {Tag, Reply} ->
+            erlang:demonitor(Monitor, [flush]),
+            Reply;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            {error, {agent_down, Reason}}
+    after TimeoutMs ->
+        erlang:demonitor(Monitor, [flush]),
+        {error, timeout}
+    end.
 
 %% ------------------------------------------------------------------- internals
 
