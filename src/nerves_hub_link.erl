@@ -237,7 +237,7 @@
     firmware_keys => [binary() | string()],
     request_firmware_keys => boolean(),
     firmware_trial => #{boot_attempts => pos_integer(), join_timeout_ms => pos_integer()} | off,
-    network_interface => binary(),
+    network_interface => binary() | fun(() -> binary()),
     reconnect_backoff => {pos_integer(), pos_integer()},
     log_flush_ms => pos_integer(),
     log_buffer => pos_integer(),

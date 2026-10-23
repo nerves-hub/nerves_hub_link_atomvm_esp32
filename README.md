@@ -205,7 +205,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `heartbeat_ms` | 30000 | |
 | `reconnect_backoff` | `{1000, 60000}` | First and longest wait between reconnects, in ms |
 | `firmware_trial` | `#{boot_attempts => 3, join_timeout_ms => 300000}` | Or `off`. See [on trial](#on-trial) |
-| `network_interface` | `<<"wlan0">>` | What the device reports it connects over |
+| `network_interface` | `<<"wlan0">>` | What the device reports it connects over, or a function asked on each join |
 | `log_flush_ms` | 10000 | How long batched log lines wait |
 | `log_buffer` | 100 | Log lines held before the oldest are dropped |
 | `transport` | `websocket_client` | |
@@ -452,7 +452,9 @@ healthy and silently stops receiving updates.
 | `meta.firmware_auto_revert_detected` | `true` after a revert, until the next update proves itself |
 
 After joining it also reports `report_network_interface`, from
-`network_interface`.
+`network_interface`. A function there is asked on each join and as a download
+starts, so a device that falls back from Ethernet to Wi-Fi or a modem reports
+the network it is on now.
 
 So the device reports what is actually running rather than a constant it was
 compiled with. There is no UUID: NervesHub derives one from the digest using the

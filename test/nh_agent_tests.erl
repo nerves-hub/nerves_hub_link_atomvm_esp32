@@ -729,6 +729,40 @@ the_network_interface_is_reported_on_join_test() ->
 
     nh_agent:stop(Agent).
 
+%% A device that moves between networks without restarting the agent says
+%% which one it is on as it joins.
+a_network_interface_function_is_asked_on_each_join_test() ->
+    Key = {?MODULE, interface},
+    persistent_term:put(Key, <<"eth0">>),
+    setup(),
+    {ok, Agent} = nh_agent:start(
+        config(#{
+            reconnect_backoff => {10, 20},
+            network_interface => fun() -> persistent_term:get(Key) end
+        })
+    ),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef, Ref | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef, Ref, <<"device">>),
+    ?assertEqual(
+        #{<<"interface">> => <<"eth0">>}, wait_for_event(<<"report_network_interface">>, 1000)
+    ),
+
+    persistent_term:put(Key, <<"wwan0">>),
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    ?assertEqual(
+        #{<<"interface">> => <<"wwan0">>}, wait_for_event(<<"report_network_interface">>, 1000)
+    ),
+
+    persistent_term:erase(Key),
+    nh_agent:stop(Agent).
+
 %% --------------------------------------------------------------------- scripts
 
 run_script(Agent, JoinRef, Text) ->

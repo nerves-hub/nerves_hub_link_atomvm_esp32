@@ -103,7 +103,9 @@
     handler => pid(),
     heartbeat_ms => pos_integer(),
     reconnect_backoff => {pos_integer(), pos_integer()},
-    network_interface => binary(),
+    %% A function is asked on each join and download, for a device that
+    %% changes network without restarting the agent.
+    network_interface => binary() | fun(() -> binary()),
     firmware_trial => #{boot_attempts => pos_integer(), join_timeout_ms => pos_integer()} | off,
     log_flush_ms => pos_integer(),
     log_buffer => pos_integer()
@@ -1055,7 +1057,10 @@ now_ms() ->
     erlang:system_time(millisecond).
 
 network_interface(#{config := Config}) ->
-    maps:get(network_interface, Config, ?DEFAULT_NETWORK_INTERFACE).
+    case maps:get(network_interface, Config, ?DEFAULT_NETWORK_INTERFACE) of
+        Fun when is_function(Fun, 0) -> Fun();
+        Interface -> Interface
+    end.
 
 %% What the device reports about itself on every join: its firmware, which
 %% protocol version it speaks, whether that firmware has proved itself, and
