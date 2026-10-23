@@ -5,6 +5,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `console_commands` adds the application's own console commands, as `{Name,
+  Description, Fun}` or `{Section, Name, Description, Fun}`. `help` lists the
+  commands by section (`device`, `network`, then the application's); one with a
+  built-in's name replaces it, and one that raises prints the error.
+- The console's up and down arrows walk through the last 20 lines entered, as
+  a shell does, and `clear` clears the screen.
+
 ## [0.2.0] - 2026-09-24
 
 Upgrading changes what a device does by default. **Changed** lists what to

@@ -198,6 +198,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `updates` | `auto` | `manual` reports the offer and does nothing |
 | `reboot` | `auto` | `manual` reports `reboot_requested` instead |
 | `console` | `false` | Join NervesHub's console channel |
+| `console_commands` | `[]` | The application's own console commands. See [the console](#the-console) |
 | `extensions` | none | `all`, or any of `health`, `geo`, `logging` |
 | `capture_io` | `false` | Send what the application prints |
 | `register` | none | Register the agent under a name |
@@ -330,7 +331,24 @@ which is off by default. Without it a device configured with keys reports
 `console => true` joins NervesHub's console channel. On Nerves, `nerves_hub_link`
 answers that channel with an IEx session. AtomVM has no shell, so this answers
 with a fixed set of commands instead: `help`, `info`, `firmware`, `memory`,
-`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`.
+`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`, `clear`. The up
+and down arrows walk through the last lines entered.
+
+`console_commands` adds the application's own:
+
+```erlang
+console_commands => [
+    {<<"relays">>, <<"the relay states">>, fun(_Args) -> my_app:relays() end},
+    {<<"io">>, <<"di">>, <<"the digital inputs">>, fun(Args) -> my_app:inputs(Args) end}
+]
+```
+
+`Fun` gets the line's arguments and returns the output (iodata). It runs in the
+agent, so it must be quick; one that raises prints the error instead of taking
+the console down. `help` lists the commands by section: the built-in ones are
+in `device` and `network`, an application's goes in the section it names or in
+`application`. One with a built-in's name replaces it. Support scripts run the
+built-in commands only.
 
 It reports, and it reboots. It will not evaluate Erlang, and it is not a way in
 to a running system.

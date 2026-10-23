@@ -294,8 +294,11 @@ wait_for_event(Event, Timeout) ->
 
 %% Joins both topics and answers both joins, returning the console's join ref.
 join_with_console() ->
+    join_with_console(#{}).
+
+join_with_console(Extra) ->
     setup(),
-    {ok, Agent} = nh_agent:start(config(#{console => true})),
+    {ok, Agent} = nh_agent:start(config(Extra#{console => true})),
     _ = next_opened(),
     Agent ! {websocket, fake_handle, connected},
 
@@ -355,6 +358,19 @@ keystrokes_are_echoed_back_test() ->
     send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"info">>}),
     #{<<"data">> := Data} = wait_for_event(<<"up">>, 1000),
     ?assertEqual(<<"info">>, Data),
+
+    nh_agent:stop(Agent).
+
+%% The application's own commands answer on the console as the built-in ones do.
+an_application_command_answers_on_the_console_topic_test() ->
+    {Agent, JoinRef} = join_with_console(#{
+        console_commands => [{<<"relays">>, <<"the relay states">>, fun(_) -> <<"r1 on">> end}]
+    }),
+    _Banner = wait_for_event(<<"up">>, 1000),
+
+    send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"relays\r">>}),
+    #{<<"data">> := Data} = wait_for_event(<<"up">>, 1000),
+    ?assertMatch({_, _}, binary:match(Data, <<"r1 on">>)),
 
     nh_agent:stop(Agent).
 
