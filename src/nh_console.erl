@@ -35,7 +35,7 @@
 %%-----------------------------------------------------------------------------
 -module(nh_console).
 
--export([new/0, banner/0, prompt/0, handle_input/2, restart/1, parse/1, commands/0]).
+-export([new/0, banner/0, prompt/0, handle_input/2, restart/1, parse/1, commands/0, chunks/2]).
 -export([run_command/1]).
 
 %% Terminals want CRLF, and NervesHub replays exactly what it is sent.
@@ -143,6 +143,33 @@ fold_input(<<_Byte, Rest/binary>>, State, Acc) ->
 submit(Rest, #{line := Line} = State, Acc) ->
     Output = <<(?EOL)/binary, (run(Line))/binary, (?PROMPT)/binary>>,
     fold_input(Rest, State#{line => <<>>}, [Output | Acc]).
+
+%%-----------------------------------------------------------------------------
+%% @doc Split output into pieces of at most `Size' bytes, never inside a UTF-8
+%% sequence.
+%%
+%% Each `up' is JSON-encoded in the agent, and on AtomVM that costs the
+%% process many times the output's size in heap -- a 2 KB page of text with
+%% quotes in it needed more than an ESP32 without PSRAM had in one block, and
+%% took the device down. Sent in pieces, the cost is that of one piece.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec chunks(binary(), pos_integer()) -> [binary()].
+chunks(Output, Size) when byte_size(Output) =< Size ->
+    [Output];
+chunks(Output, Size) ->
+    Cut = boundary(Output, Size),
+    <<Chunk:Cut/binary, Rest/binary>> = Output,
+    [Chunk | chunks(Rest, Size)].
+
+%% Back off past continuation bytes (10xxxxxx), so a character stays whole.
+boundary(Output, Cut) when Cut > 1 ->
+    case binary:at(Output, Cut) band 16#C0 of
+        16#80 -> boundary(Output, Cut - 1);
+        _ -> Cut
+    end;
+boundary(_Output, Cut) ->
+    Cut.
 
 %%-----------------------------------------------------------------------------
 %% @doc Split a line into a command and its arguments.

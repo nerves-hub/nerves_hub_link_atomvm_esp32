@@ -363,12 +363,20 @@ a_command_answers_on_the_console_topic_test() ->
     _Banner = wait_for_event(<<"up">>, 1000),
 
     send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"help\r">>}),
-    #{<<"data">> := Data} = wait_for_event(<<"up">>, 1000),
+    Data = console_until_prompt(<<>>),
 
     ?assertMatch({_, _}, binary:match(Data, <<"reboot">>)),
-    ?assertMatch({_, _}, binary:match(Data, nh_console:prompt())),
 
     nh_agent:stop(Agent).
+
+%% Output longer than one piece arrives in several `up's; the prompt ends it.
+console_until_prompt(Acc) ->
+    #{<<"data">> := Data} = wait_for_event(<<"up">>, 1000),
+    All = <<Acc/binary, Data/binary>>,
+    case binary:match(Data, nh_console:prompt()) of
+        nomatch -> console_until_prompt(All);
+        _ -> All
+    end.
 
 restart_resets_the_session_rather_than_the_device_test() ->
     {Agent, JoinRef} = join_with_console(),

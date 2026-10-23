@@ -88,6 +88,8 @@
 -define(DEFAULT_LOG_BUFFER, 100).
 -define(DEFAULT_NETWORK_INTERFACE, <<"wlan0">>).
 -define(DEFAULT_TRIAL, #{boot_attempts => 3, join_timeout_ms => 300000}).
+%% Console output goes up in pieces of at most this many bytes (`nh_console:chunks/2').
+-define(CONSOLE_CHUNK, 256).
 %% Replies to extension pushes are matched by reference; this many are kept.
 -define(EXT_REFS_KEPT, 16).
 
@@ -988,14 +990,20 @@ maybe_add_console(Channel, Config) ->
     end.
 
 %% Console output only goes anywhere if the channel joined, and `push/4'
-%% already refuses on a topic that has not.
+%% already refuses on a topic that has not. In pieces: see `nh_console:chunks/2'.
 console_out(<<>>, State) ->
     State;
 console_out(Output, State) ->
-    {Channel, Actions} = nh_channel:push(
-        <<"console">>, <<"up">>, #{<<"data">> => Output}, maps:get(channel, State)
-    ),
-    run(Actions, State#{channel => Channel}).
+    lists:foldl(
+        fun(Chunk, Acc) ->
+            {Channel, Actions} = nh_channel:push(
+                <<"console">>, <<"up">>, #{<<"data">> => Chunk}, maps:get(channel, Acc)
+            ),
+            run(Actions, Acc#{channel => Channel})
+        end,
+        State,
+        nh_console:chunks(Output, ?CONSOLE_CHUNK)
+    ).
 
 %% ------------------------------------------------------------------ helpers
 
