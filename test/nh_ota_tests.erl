@@ -101,8 +101,9 @@ opts(Extra) ->
             http => nh_ota_fake_http,
             flash => nh_ota_fake_flash,
             slot => ?SLOT,
-            %% Retries are real sleeps, and a test has no weak link to wait out.
-            retry_backoff => {1, 2}
+            %% A resume waits in real time, and a test has no weak link to wait
+            %% out.
+            resume_after_ms => 100
         },
         Extra
     ).
@@ -192,12 +193,12 @@ a_refused_connection_is_an_error_not_a_crash_test() ->
     ok = nh_ota_fake_http:fail_connect(),
     ok = nh_ota_fake_flash:expect(#{}),
 
-    Result = nh_ota:apply_update(payload(body()), opts(#{})),
+    Result = nh_ota:apply_update(payload(body()), opts(#{resume_after_ms => 10})),
 
     cleanup(ok),
     %% Tried again, since a refused connection is often a moment's outage, and
     %% reported once the retries are spent.
-    ?assertMatch({error, {download_failed, {connect_failed, _}}}, Result).
+    ?assertMatch({error, {connect_failed, _}}, Result).
 
 a_non_200_response_is_refused_test() ->
     ok = nh_ota_fake_esp:start(),
@@ -208,6 +209,84 @@ a_non_200_response_is_refused_test() ->
 
     cleanup(ok),
     ?assertEqual({error, {http_status, 404}}, Result).
+
+%% ---------------------------------------------------------------- resuming
+
+%% Over a modem the last bytes of a download sometimes never arrive (#27 in
+%% iobee_bee): the connection goes quiet and stays so. A quiet or cut
+%% connection is resumed from the byte it stopped at, and the archive is still
+%% checked whole.
+resume(Cuts, Extra) ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve_cut(body(), Cuts),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+    Self = self(),
+    Opts = opts(Extra#{resume_after_ms => 50, resumed => fun(At) -> Self ! {resumed, At} end}),
+
+    Result = nh_ota:apply_update(payload(body()), Opts),
+    Written = nh_ota_fake_esp:written(),
+    Ranges = nh_ota_fake_http:ranges(),
+
+    cleanup(ok),
+    {Result, Written, Ranges, resumed()}.
+
+resumed() ->
+    receive
+        {resumed, At} -> [At | resumed()]
+    after 0 -> []
+    end.
+
+a_quiet_or_cut_connection_resumes_where_it_stopped_test() ->
+    {Result, Written, Ranges, Resumed} = resume([{5000, stall}, {8000, close}], #{}),
+
+    ?assertEqual({ok, ?SLOT}, Result),
+    ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))),
+    ?assertEqual([none, <<"bytes=5000-">>, <<"bytes=8000-">>], Ranges),
+    ?assertEqual([5000, 8000], Resumed).
+
+a_connection_that_never_answers_is_resumed_from_the_start_test() ->
+    {Result, _Written, Ranges, Resumed} = resume([{0, stall}], #{}),
+
+    ?assertEqual({ok, ?SLOT}, Result),
+    ?assertEqual([none, <<"bytes=0-">>], Ranges),
+    ?assertEqual([0], Resumed).
+
+%% A slow link can take several connections to carry an archive: each one that
+%% brings something starts the count again.
+connections_that_bring_something_keep_resuming_test() ->
+    Cuts = [{1000, stall}, {2000, stall}, {3000, close}, {4000, stall}, {5000, stall}],
+    {Result, Written, _Ranges, Resumed} = resume(Cuts, #{resumes => 3}),
+
+    ?assertEqual({ok, ?SLOT}, Result),
+    ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))),
+    ?assertEqual([1000, 2000, 3000, 4000, 5000], Resumed).
+
+it_gives_up_after_connections_in_a_row_that_bring_nothing_test() ->
+    Cuts = [{1000, stall}, {1000, stall}, {1000, close}, {1000, stall}],
+    {Result, _Written, Ranges, Resumed} = resume(Cuts, #{resumes => 3}),
+
+    ?assertEqual({error, download_stalled}, Result),
+    ?assertEqual(4, length(Ranges)),
+    ?assertEqual([1000, 1000, 1000], Resumed).
+
+a_refused_connection_is_tried_again_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:fail_connect(),
+    ok = nh_ota_fake_flash:expect(#{}),
+    Self = self(),
+    Opts = opts(#{resume_after_ms => 50, resumed => fun(At) -> Self ! {resumed, At} end}),
+
+    Started = erlang:monotonic_time(millisecond),
+    Result = nh_ota:apply_update(payload(body()), Opts),
+    Took = erlang:monotonic_time(millisecond) - Started,
+
+    cleanup(ok),
+    ?assertMatch({error, {connect_failed, _}}, Result),
+    %% Three connections that brought nothing: the first and two resumes.
+    ?assertEqual([0, 0], resumed()),
+    %% A connect that fails at once is not tried again at once (#27 in
+    %% iobee_bee): 50 ms after the first, 100 ms after the second.
+    ?assert(Took >= 150).
 
 %% ------------------------------------------------------- pending/commit/revert
 
@@ -277,14 +356,16 @@ a_server_that_ignores_range_is_taken_from_the_start_test() ->
 
 a_download_that_keeps_dropping_gives_up_test() ->
     ok = nh_ota_fake_esp:start(),
-    ok = nh_ota_fake_http:serve(body(), #{drops => [100, 100, 100]}),
+    %% Connections that bring nothing: one that brings something would start
+    %% the count again (see `connections_that_bring_something_keep_resuming').
+    ok = nh_ota_fake_http:serve(body(), #{drops => [100, 0, 0, 0]}),
     ok = nh_ota_fake_flash:expect(#{}),
 
-    Result = nh_ota:apply_update(payload(body()), opts(#{max_retries => 2})),
+    Result = nh_ota:apply_update(payload(body()), opts(#{resumes => 3, resume_after_ms => 10})),
     Nvs = nh_ota_fake_esp:nvs(),
 
     cleanup(ok),
-    ?assertMatch({error, {download_failed, {incomplete, _, _}}}, Result),
+    ?assertMatch({error, {stream_failed, closed}}, Result),
     ?assertEqual(undefined, maps:get({atomvm, boot_path}, Nvs, undefined)).
 
 a_server_error_is_tried_again_test() ->
@@ -292,11 +373,11 @@ a_server_error_is_tried_again_test() ->
     ok = nh_ota_fake_http:serve(body(), 503),
     ok = nh_ota_fake_flash:expect(#{}),
 
-    Result = nh_ota:apply_update(payload(body()), opts(#{max_retries => 1})),
+    Result = nh_ota:apply_update(payload(body()), opts(#{resumes => 2, resume_after_ms => 10})),
     Requests = nh_ota_fake_http:requests(),
 
     cleanup(ok),
-    ?assertEqual({error, {download_failed, {http_status, 503}}}, Result),
+    ?assertEqual({error, {http_status, 503}}, Result),
     ?assertEqual(2, length(Requests)).
 
 each_attempt_is_announced_test() ->
