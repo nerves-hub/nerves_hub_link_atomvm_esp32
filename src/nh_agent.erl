@@ -131,6 +131,13 @@
 -define(GONE_TIMEOUT_MS, 5000).
 -define(RECLAIM_MS, 200).
 
+%% How long after a failed update the device joins again, so that NervesHub
+%% offers it again: doubling from the first to the second with each failure in
+%% a row, until an update succeeds. A failure that repeats at once (a 404, a
+%% bad signature, an archive too big for the slot) would otherwise be offered,
+%% fail and be offered again every few seconds, each round a TLS handshake.
+-define(DEFAULT_UPDATE_RETRY_BACKOFF, {30000, 3600000}).
+
 -type config() :: #{
     url => binary() | string(),
     host => binary() | string(),
@@ -154,7 +161,8 @@
     download_resume_after_ms => pos_integer(),
     download_resumes => pos_integer(),
     keep_open_above => non_neg_integer() | never,
-    before_update => fun(() -> ok)
+    before_update => fun(() -> ok),
+    update_retry_backoff => {pos_integer(), pos_integer()}
 }.
 
 -export_type([config/0]).
@@ -345,7 +353,7 @@ disconnect(#{transport := Transport, handle := Handle} = State0) ->
     State2 = lists:foldl(
         fun cancel_timer/2,
         State1,
-        [heartbeat, connect_timeout, extensions_fallback, log_flush]
+        [heartbeat, connect_timeout, extensions_fallback, log_flush, rejoin]
     ),
     State2#{
         handle => undefined,
@@ -387,6 +395,12 @@ fire(trial_deadline, State) ->
     trial_expired(State);
 fire(update_idle, State) ->
     update_stalled(State);
+%% Closed as for a download, so the transport is gone and its memory back
+%% before the new connection asks for its own.
+fire(rejoin, State) ->
+    reopen(close_for_download(State));
+fire(reopen, State) ->
+    reopen(State);
 fire({request, Kind}, State) ->
     reply_request(Kind, {error, timeout}, State);
 fire({script, Ref}, State) ->
@@ -839,7 +853,7 @@ updater({ok, Slot}, State) ->
     %% call: it may have work to finish first, and a library that restarts a
     %% device on its own is a library that surprises someone.
     notify(State, {update_ready, Slot}),
-    State1 = status_update(<<"completed">>, #{}, State),
+    State1 = status_update(<<"completed">>, #{}, State#{failed_updates => 0}),
     reopen(cancel_timer(update_idle, maps:remove(update, State1#{armed => Slot})));
 updater({error, Reason}, State) ->
     update_failed(Reason, describe(Reason), State).
@@ -850,12 +864,31 @@ update_stalled(#{update := Pid} = State) ->
 update_stalled(State) ->
     State.
 
-%% Reported now if the socket stayed open and joined; otherwise on the next join,
-%% which reopening a socket closed for the download is.
+%% Reported now if the socket stayed open and joined; otherwise on the next join.
+%%
+%% NervesHub offers an update again only when the device joins again. With
+%% the socket kept open, nothing would ever ask again, so it reconnects; with
+%% it closed for the download, it opens again. Either waits
+%% `update_retry_backoff', longer with each failure in a row.
 update_failed(Reason, Described, State) ->
     notify(State, {update_failed, Reason}),
     State1 = status_update(<<"failed">>, #{<<"reason">> => Described}, State),
-    reopen(cancel_timer(update_idle, maps:remove(update, State1))).
+    State2 = cancel_timer(update_idle, maps:remove(update, State1)),
+    Failures = maps:get(failed_updates, State2, 0),
+    Delay = update_retry_delay(Failures, State2),
+    State3 = State2#{failed_updates => Failures + 1},
+    case {maps:get(handle, State3), maps:get(closed_for_download, State3, false)} of
+        %% Closed for the download: it opens again after the backoff, and the
+        %% failure goes to NervesHub on that join.
+        {undefined, true} -> set_timer(reopen, Delay, State3);
+        %% Lost during the download: its own reconnect is waiting.
+        {undefined, false} -> State3;
+        {_Open, _} -> set_timer(rejoin, Delay, State3)
+    end.
+
+update_retry_delay(Failures, #{config := Config}) ->
+    {Min, Max} = maps:get(update_retry_backoff, Config, ?DEFAULT_UPDATE_RETRY_BACKOFF),
+    nh_backoff:delay(Failures, Min, Max).
 
 %% Made while the socket is closed for a download, a status update waits for
 %% the next join; NervesHub would not hear it otherwise.

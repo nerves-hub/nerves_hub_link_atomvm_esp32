@@ -217,6 +217,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `download_resumes` | 3 | Download connections in a row that bring nothing before giving up |
 | `keep_open_above` | unset: open | Close the socket while an update downloads unless this many bytes are free in one block, or `never` to always close. See [updates](#updates) |
 | `before_update` | none | A function run before a download starts, to free memory |
+| `update_retry_backoff` | `{30000, 3600000}` | First and longest wait before joining again after a failed update, in ms |
 | `transport` | `websocket_client` | |
 
 ## Updates
@@ -247,6 +248,12 @@ for the download opens again at once; one lost during it keeps its reconnect
 backoff. `before_update` runs before any of this, so the application can free
 memory of its own first; if it returns anything but `ok`, or raises, the update
 fails (`{update_failed, {before_update, Result}}`) and nothing is downloaded.
+
+NervesHub offers an update again only when the device joins. After a failed
+update the device joins again, after `update_retry_backoff`: 30 s, doubling
+with each failure in a row up to an hour, back to the start once an update
+succeeds. A socket kept open for the download reconnects; one closed for it
+opens again then, and NervesHub hears of the failure on that join.
 
 An update armed and waiting for the reboot counts as busy: NervesHub offers it
 again on the next join, and downloading it would write over a slot the device

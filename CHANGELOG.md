@@ -20,6 +20,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in "Cannot handle out of memory". Closing waits for the transport to be gone
   and its memory back. Status updates made while the socket is closed are sent
   once the device has joined again. Without the option nothing changes.
+- After a failed update the device joins again, so that NervesHub offers it
+  again: before, a socket that stayed open never asked again, and the device
+  kept its old firmware until something else made it reconnect. It waits
+  `update_retry_backoff` first (30 s, doubling with each failure in a row up
+  to an hour), so a failure that repeats at once is not a loop; a socket closed
+  for the download waits the same before it opens again.
 - `before_update`, a function run before a download starts, to free memory.
   One that does not return `ok` fails the update rather than the agent.
 
