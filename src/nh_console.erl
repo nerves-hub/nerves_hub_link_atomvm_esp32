@@ -42,6 +42,9 @@
 %% in a section, one of those or its own; without one it goes in
 %% `application'. Sections come in the order they first appear.
 %%
+%% The up and down arrows walk back and forth through the last lines entered,
+%% as a shell does, and `clear' clears the screen.
+%%
 %% File transfer is declined. `file-data/*' exists to push a file onto a device
 %% with a filesystem to put it in, and this one has partitions.
 %% @end
@@ -61,13 +64,26 @@
 -define(DELETE, 127).
 -define(ESC, 27).
 
+%% Lines kept for the arrows: enough to repeat a session's few commands,
+%% little enough to cost nothing on a device without PSRAM.
+-define(HISTORY, 20).
+%% Back to the start of the line and erase it, so a recalled line replaces
+%% what was there; and the whole screen, for `clear'.
+-define(ERASE_LINE, <<"\r\e[K">>).
+-define(CLEAR_SCREEN, <<"\e[2J\e[H">>).
+
 -type command() ::
     {binary(), binary(), fun(([binary()]) -> iodata())}
     | {binary(), binary(), binary(), fun(([binary()]) -> iodata())}.
 -type state() :: #{
     line := binary(),
     mode := input | escape | escape_bracket,
-    commands := [command()]
+    commands := [command()],
+    %% Newest first; `back' is how far up the arrows are, 0 for the line being
+    %% typed, which `typed' keeps while they are.
+    history := [binary()],
+    back := non_neg_integer(),
+    typed := binary()
 }.
 
 -export_type([state/0, command/0]).
@@ -85,7 +101,14 @@ new() -> new([]).
 %%-----------------------------------------------------------------------------
 -spec new([command()]) -> state().
 new(Commands) ->
-    #{line => <<>>, mode => input, commands => [sectioned(Command) || Command <- Commands]}.
+    #{
+        line => <<>>,
+        mode => input,
+        commands => [sectioned(Command) || Command <- Commands],
+        history => [],
+        back => 0,
+        typed => <<>>
+    }.
 
 sectioned({Name, Description, Fun}) -> {<<"application">>, Name, Description, Fun};
 sectioned({_Section, _Name, _Description, _Fun} = Command) -> Command.
@@ -116,7 +139,7 @@ prompt() -> ?PROMPT.
 -spec restart(state()) -> {state(), binary()}.
 restart(State) ->
     {
-        State#{line => <<>>, mode => input},
+        State#{line => <<>>, mode => input, back => 0},
         <<(?EOL)/binary, "*** Console restarted ***", (?EOL)/binary, (?PROMPT)/binary>>
     }.
 
@@ -134,18 +157,25 @@ handle_input(Data, State) ->
 
 fold_input(<<>>, State, Acc) ->
     {State, Acc};
-%% An arrow key is three bytes. Swallow them rather than printing the escape,
-%% which would corrupt the line the operator can see.
+%% An arrow key is three bytes. Up and down walk the history; the rest are
+%% swallowed rather than printing the escape, which would corrupt the line the
+%% operator can see.
 fold_input(<<?ESC, Rest/binary>>, #{mode := input} = State, Acc) ->
     fold_input(Rest, State#{mode => escape}, Acc);
 fold_input(<<$[, Rest/binary>>, #{mode := escape} = State, Acc) ->
     fold_input(Rest, State#{mode => escape_bracket}, Acc);
 fold_input(<<_Byte, Rest/binary>>, #{mode := escape} = State, Acc) ->
     fold_input(Rest, State#{mode => input}, Acc);
+fold_input(<<$A, Rest/binary>>, #{mode := escape_bracket, back := Back} = State, Acc) ->
+    recall(Rest, Back + 1, State#{mode => input}, Acc);
+fold_input(<<$B, Rest/binary>>, #{mode := escape_bracket, back := Back} = State, Acc) ->
+    recall(Rest, Back - 1, State#{mode => input}, Acc);
 fold_input(<<_Byte, Rest/binary>>, #{mode := escape_bracket} = State, Acc) ->
     fold_input(Rest, State#{mode => input}, Acc);
 fold_input(<<?CTRL_C, Rest/binary>>, State, Acc) ->
-    fold_input(Rest, State#{line => <<>>}, [<<"^C", (?EOL)/binary, (?PROMPT)/binary>> | Acc]);
+    fold_input(Rest, State#{line => <<>>, back => 0}, [
+        <<"^C", (?EOL)/binary, (?PROMPT)/binary>> | Acc
+    ]);
 fold_input(<<Byte, Rest/binary>>, #{line := Line} = State, Acc) when
     Byte =:= ?BACKSPACE; Byte =:= ?DELETE
 ->
@@ -174,9 +204,34 @@ fold_input(<<Byte, Rest/binary>>, #{line := Line} = State, Acc) when Byte >= 32,
 fold_input(<<_Byte, Rest/binary>>, State, Acc) ->
     fold_input(Rest, State, Acc).
 
-submit(Rest, #{line := Line, commands := Commands} = State, Acc) ->
+submit(Rest, #{line := Line, commands := Commands, history := History} = State, Acc) ->
     Output = <<(?EOL)/binary, (run(Line, Commands))/binary, (?PROMPT)/binary>>,
-    fold_input(Rest, State#{line => <<>>}, [Output | Acc]).
+    State1 = State#{line => <<>>, back => 0, history => remember(trim(Line), History)},
+    fold_input(Rest, State1, [Output | Acc]).
+
+%% A blank line, or the one just entered again, adds nothing to walk through.
+remember(<<>>, History) -> History;
+remember(Line, [Line | _] = History) -> History;
+remember(Line, History) -> lists:sublist([Line | History], ?HISTORY).
+
+%% Line `Back' of the history in place of the one on screen; 0 is what was
+%% being typed before the arrows. Past either end, nothing moves.
+recall(Rest, Back, #{history := History} = State, Acc) when Back < 0; Back > length(History) ->
+    fold_input(Rest, State, Acc);
+recall(Rest, Back, #{back := 0, line := Line} = State, Acc) ->
+    show(Rest, Back, State#{typed => Line}, Acc);
+recall(Rest, Back, State, Acc) ->
+    show(Rest, Back, State, Acc).
+
+show(Rest, 0, #{typed := Typed} = State, Acc) ->
+    redraw(Rest, Typed, State#{back => 0}, Acc);
+show(Rest, Back, #{history := History} = State, Acc) ->
+    redraw(Rest, lists:nth(Back, History), State#{back => Back}, Acc).
+
+redraw(Rest, Line, State, Acc) ->
+    fold_input(Rest, State#{line => Line}, [
+        <<(?ERASE_LINE)/binary, (?PROMPT)/binary, Line/binary>> | Acc
+    ]).
 
 %%-----------------------------------------------------------------------------
 %% @doc Split output into pieces of at most `Size' bytes, never inside a UTF-8
@@ -253,6 +308,7 @@ built_in() ->
         {<<"device">>, <<"partitions">>, <<"the flash partition table">>},
         {<<"device">>, <<"uptime">>, <<"how long since boot">>},
         {<<"device">>, <<"reboot">>, <<"restart the device">>},
+        {<<"device">>, <<"clear">>, <<"clear the screen (up/down arrows: the last commands)">>},
         {<<"network">>, <<"net">>, <<"network address and signal">>},
         {<<"network">>, <<"geo">>, <<"resolve this device's location over GeoIP">>}
     ].
@@ -330,6 +386,8 @@ execute({_Section, _Name, _Description, Fun}, _Command, Args) ->
 execute(false, Command, Args) ->
     execute(Command, Args).
 
+execute(<<"clear">>, _Args) ->
+    ?CLEAR_SCREEN;
 execute(<<"info">>, _Args) ->
     lines([
         {<<"atomvm">>, nh_metadata:atomvm_version()},

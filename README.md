@@ -332,7 +332,8 @@ which is off by default. Without it a device configured with keys reports
 `console => true` joins NervesHub's console channel. On Nerves, `nerves_hub_link`
 answers that channel with an IEx session. AtomVM has no shell, so this answers
 with a fixed set of commands instead: `help`, `info`, `firmware`, `memory`,
-`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`.
+`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`, `clear`. The up
+and down arrows walk through the last lines entered.
 
 `console_commands` adds the application's own:
 
