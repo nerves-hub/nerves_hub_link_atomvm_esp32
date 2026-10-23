@@ -29,13 +29,26 @@
 %% broken. `restart' clears the session the way it restarts IEx on Nerves —
 %% it does not restart the device, which is what `reboot' is for.
 %%
+%% An application can add commands of its own (`console_commands' in
+%% `nerves_hub_link''s config): `{Name, Description, Fun}', where `Fun' takes
+%% the line's arguments and returns the output. They run in the agent, so they
+%% must be quick, and one that raises prints the error instead of taking the
+%% console down.
+%%
+%% One with a built-in's name replaces it (`net', say, for a richer status).
+%%
+%% `help' lists the commands by section: the built-in ones are in `device' and
+%% `network'. `{Section, Name, Description, Fun}' puts an application's command
+%% in a section, one of those or its own; without one it goes in
+%% `application'. Sections come in the order they first appear.
+%%
 %% File transfer is declined. `file-data/*' exists to push a file onto a device
 %% with a filesystem to put it in, and this one has partitions.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_console).
 
--export([new/0, banner/0, prompt/0, handle_input/2, restart/1, parse/1, commands/0, chunks/2]).
+-export([new/0, new/1, banner/0, prompt/0, handle_input/2, restart/1, parse/1, commands/0, chunks/2]).
 -export([run_command/1]).
 
 %% Terminals want CRLF, and NervesHub replays exactly what it is sent.
@@ -48,16 +61,34 @@
 -define(DELETE, 127).
 -define(ESC, 27).
 
--type state() :: #{line := binary(), mode := input | escape | escape_bracket}.
+-type command() ::
+    {binary(), binary(), fun(([binary()]) -> iodata())}
+    | {binary(), binary(), binary(), fun(([binary()]) -> iodata())}.
+-type state() :: #{
+    line := binary(),
+    mode := input | escape | escape_bracket,
+    commands := [command()]
+}.
 
--export_type([state/0]).
+-export_type([state/0, command/0]).
 
 %%-----------------------------------------------------------------------------
 %% @doc A console session with nothing typed.
 %% @end
 %%-----------------------------------------------------------------------------
 -spec new() -> state().
-new() -> #{line => <<>>, mode => input}.
+new() -> new([]).
+
+%%-----------------------------------------------------------------------------
+%% @doc A console session with the application's own commands as well.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec new([command()]) -> state().
+new(Commands) ->
+    #{line => <<>>, mode => input, commands => [sectioned(Command) || Command <- Commands]}.
+
+sectioned({Name, Description, Fun}) -> {<<"application">>, Name, Description, Fun};
+sectioned({_Section, _Name, _Description, _Fun} = Command) -> Command.
 
 %%-----------------------------------------------------------------------------
 %% @doc What to send when someone first attaches.
@@ -83,8 +114,11 @@ prompt() -> ?PROMPT.
 %% @end
 %%-----------------------------------------------------------------------------
 -spec restart(state()) -> {state(), binary()}.
-restart(_State) ->
-    {new(), <<(?EOL)/binary, "*** Console restarted ***", (?EOL)/binary, (?PROMPT)/binary>>}.
+restart(State) ->
+    {
+        State#{line => <<>>, mode => input},
+        <<(?EOL)/binary, "*** Console restarted ***", (?EOL)/binary, (?PROMPT)/binary>>
+    }.
 
 %%-----------------------------------------------------------------------------
 %% @doc Feed keystrokes in, get terminal output back.
@@ -140,8 +174,8 @@ fold_input(<<Byte, Rest/binary>>, #{line := Line} = State, Acc) when Byte >= 32,
 fold_input(<<_Byte, Rest/binary>>, State, Acc) ->
     fold_input(Rest, State, Acc).
 
-submit(Rest, #{line := Line} = State, Acc) ->
-    Output = <<(?EOL)/binary, (run(Line))/binary, (?PROMPT)/binary>>,
+submit(Rest, #{line := Line, commands := Commands} = State, Acc) ->
+    Output = <<(?EOL)/binary, (run(Line, Commands))/binary, (?PROMPT)/binary>>,
     fold_input(Rest, State#{line => <<>>}, [Output | Acc]).
 
 %%-----------------------------------------------------------------------------
@@ -206,23 +240,28 @@ trim_trailing(Line) ->
 %%-----------------------------------------------------------------------------
 -spec commands() -> [{binary(), binary()}].
 commands() ->
+    [{<<"help">>, <<"this list">>}] ++
+        [{Name, Description} || {_Section, Name, Description} <- built_in()].
+
+%% The built-in commands, by section.
+built_in() ->
     [
-        {<<"help">>, <<"this list">>},
-        {<<"info">>, <<"AtomVM and application versions">>},
-        {<<"firmware">>, <<"the running packbeam, its digest and slot">>},
-        {<<"memory">>, <<"heap and process counts">>},
-        {<<"partitions">>, <<"the flash partition table">>},
-        {<<"net">>, <<"network address and signal">>},
-        {<<"geo">>, <<"resolve this device's location over GeoIP">>},
-        {<<"signature">>, <<"check the running firmware's signature">>},
-        {<<"uptime">>, <<"how long since boot">>},
-        {<<"reboot">>, <<"restart the device">>}
+        {<<"device">>, <<"info">>, <<"AtomVM and application versions">>},
+        {<<"device">>, <<"firmware">>, <<"the running packbeam, its digest and slot">>},
+        {<<"device">>, <<"signature">>, <<"check the running firmware's signature">>},
+        {<<"device">>, <<"memory">>, <<"heap and process counts">>},
+        {<<"device">>, <<"partitions">>, <<"the flash partition table">>},
+        {<<"device">>, <<"uptime">>, <<"how long since boot">>},
+        {<<"device">>, <<"reboot">>, <<"restart the device">>},
+        {<<"network">>, <<"net">>, <<"network address and signal">>},
+        {<<"network">>, <<"geo">>, <<"resolve this device's location over GeoIP">>}
     ].
 
-run(Line) ->
+run(Line, Commands) ->
     case parse(Line) of
         empty -> <<>>;
-        {Command, Args} -> execute(Command, Args)
+        {<<"help">>, _Args} -> help(Commands);
+        {Command, Args} -> execute(lists:keyfind(Command, 2, Commands), Command, Args)
     end.
 
 %%-----------------------------------------------------------------------------
@@ -230,7 +269,8 @@ run(Line) ->
 %%
 %% The console only prints, so it does not care. A script does: a line that is
 %% not a command is a script that did not do what it says, and NervesHub should
-%% hear that it failed rather than that it completed.
+%% hear that it failed rather than that it completed. A script runs the
+%% built-in commands, not the application's.
 %% @end
 %%-----------------------------------------------------------------------------
 -spec run_command(binary()) -> {ok, binary()} | {error, binary()}.
@@ -238,19 +278,58 @@ run_command(Line) ->
     case parse(Line) of
         empty ->
             {ok, <<>>};
-        {Command, Args} ->
+        {Command, _Args} ->
             case lists:keymember(Command, 1, commands()) of
-                true -> {ok, execute(Command, Args)};
-                false -> {error, execute(Command, Args)}
+                true -> {ok, run(Line, [])};
+                false -> {error, run(Line, [])}
             end
     end.
 
-execute(<<"help">>, _Args) ->
-    Rows = [
-        <<"  ", (pad(Name, 12))/binary, Description/binary, (?EOL)/binary>>
-     || {Name, Description} <- commands()
-    ],
-    iolist_to_binary([Rows]);
+%% An application's command of a built-in's name replaces it, in `help' as
+%% when it runs.
+help(Commands) ->
+    Own = [Name || {_Section, Name, _Description, _Fun} <- Commands],
+    All =
+        [
+            Command
+         || {_Section, Name, _Description} = Command <- built_in(), not lists:member(Name, Own)
+        ] ++
+            [{Section, Name, Description} || {Section, Name, Description, _Fun} <- Commands],
+    Sections = lists:foldl(
+        fun({Section, _, _}, Seen) ->
+            case lists:member(Section, Seen) of
+                true -> Seen;
+                false -> Seen ++ [Section]
+            end
+        end,
+        [],
+        All
+    ),
+    iolist_to_binary(
+        [
+            [
+                [Section, ?EOL],
+                [
+                    <<"  ", (pad(Name, 12))/binary, Description/binary, (?EOL)/binary>>
+                 || {In, Name, Description} <- All, In =:= Section
+                ],
+                ?EOL
+            ]
+         || Section <- Sections
+        ]
+    ).
+
+%% The application's, or else a built-in one.
+execute({_Section, _Name, _Description, Fun}, _Command, Args) ->
+    try
+        iolist_to_binary(Fun(Args))
+    catch
+        Class:Reason ->
+            iolist_to_binary(io_lib:format("~p: ~p~ts", [Class, Reason, ?EOL]))
+    end;
+execute(false, Command, Args) ->
+    execute(Command, Args).
+
 execute(<<"info">>, _Args) ->
     lines([
         {<<"atomvm">>, nh_metadata:atomvm_version()},

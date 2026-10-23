@@ -40,6 +40,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSON-encoded in the agent, which on AtomVM costs the process many times the
   output's size in heap: a 2 KB answer with quotes in it took more than an
   ESP32 without PSRAM had in one block, and the device panicked.
+- `console_commands` adds the application's own console commands, as `{Name,
+  Description, Fun}` or `{Section, Name, Description, Fun}`. `help` lists the
+  commands by section (`device`, `network`, then the application's); one with a
+  built-in's name replaces it, and one that raises prints the error.
 
 ## [0.2.0] - 2026-09-24
 

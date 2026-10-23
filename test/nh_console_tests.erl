@@ -147,3 +147,60 @@ chunks_test() ->
         end,
         Chunks
     ).
+
+%% An application's commands run with the line's arguments, show up in `help',
+%% and one that raises prints the error rather than taking the console down.
+application_commands_test() ->
+    Commands = [
+        {<<"echo">>, <<"say it back">>, fun(Args) -> [lists:join(<<"|">>, Args), <<"\r\n">>] end},
+        {<<"boom">>, <<"raise">>, fun(_Args) -> error(kaboom) end}
+    ],
+    State = nh_console:new(Commands),
+    {State1, Echo} = nh_console:handle_input(<<"echo a b\r">>, State),
+    ?assertMatch({_, _}, binary:match(Echo, <<"a|b">>)),
+    {State2, Help} = nh_console:handle_input(<<"help\r">>, State1),
+    ?assertMatch({_, _}, binary:match(Help, <<"say it back">>)),
+    ?assertMatch({_, _}, binary:match(Help, <<"uptime">>)),
+    {State3, Boom} = nh_console:handle_input(<<"boom\r">>, State2),
+    ?assertMatch({_, _}, binary:match(Boom, <<"kaboom">>)),
+    {State4, _} = nh_console:restart(State3),
+    {_, Again} = nh_console:handle_input(<<"echo c\r">>, State4),
+    ?assertMatch({_, _}, binary:match(Again, <<"c">>)).
+
+%% `help' groups by section: the built-in ones, an application's command in one
+%% of those or its own, and the rest under `application', in order of first
+%% appearance.
+help_groups_by_section_test() ->
+    Noop = fun(_Args) -> <<>> end,
+    State = nh_console:new([
+        {<<"plain">>, <<"no section">>, Noop},
+        {<<"network">>, <<"ping">>, <<"reach a host">>, Noop},
+        {<<"storage">>, <<"fs">>, <<"files">>, Noop}
+    ]),
+    {_, Help} = nh_console:handle_input(<<"help\r">>, State),
+    Order = [
+        <<"device\r\n">>,
+        <<"uptime">>,
+        <<"network\r\n">>,
+        <<"geo">>,
+        <<"ping">>,
+        <<"application\r\n">>,
+        <<"plain">>,
+        <<"storage\r\n">>,
+        <<"fs ">>
+    ],
+    Positions = [element(1, binary:match(Help, Part)) || Part <- Order],
+    ?assertEqual(lists:sort(Positions), Positions),
+    {_, Ping} = nh_console:handle_input(<<"ping\r">>, State),
+    ?assertEqual(nomatch, binary:match(Ping, <<"unknown">>)).
+
+%% An application's `net' replaces the built-in one, in `help' too.
+an_application_command_replaces_a_built_in_test() ->
+    State = nh_console:new([
+        {<<"network">>, <<"net">>, <<"the app's net">>, fun(_) -> <<"mine">> end}
+    ]),
+    {_, Help} = nh_console:handle_input(<<"help\r">>, State),
+    {_, Net} = nh_console:handle_input(<<"net\r">>, State),
+    ?assertMatch({_, _}, binary:match(Help, <<"the app's net">>)),
+    ?assertEqual(nomatch, binary:match(Help, <<"network address and signal">>)),
+    ?assertMatch({_, _}, binary:match(Net, <<"mine">>)).
