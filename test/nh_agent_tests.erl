@@ -1313,6 +1313,94 @@ a_batch_stops_at_its_byte_limit_test() ->
 
     nh_agent:stop(Agent).
 
+%% ------------------------------------------------------------ error reports
+
+reports_advert() ->
+    #{<<"extensions">> := Extensions} = advert(),
+    #{<<"extensions">> => Extensions#{<<"error_reports">> => [<<"0.1.0">>]}}.
+
+join_with_reports(Extra) ->
+    join_with_extensions(
+        maps:merge(#{extensions => [error_reports]}, Extra), [<<"error_reports">>], reports_advert()
+    ).
+
+%% Reports made within a second go together, NervesHub's rate.
+error_reports_go_in_a_batch_test() ->
+    {Agent, _Ref, Offered} = join_with_reports(#{}),
+    ?assertEqual(#{<<"error_reports">> => <<"0.1.0">>}, Offered),
+
+    ok = nerves_hub_link:report_error(Agent, error, first, #{}),
+    ok = nerves_hub_link:report_error(Agent, error, second, #{context => #{step => 2}}),
+    #{<<"reports">> := Reports} = wait_for_event(<<"error_reports:report">>, 2000),
+    ?assertEqual([<<"first">>, <<"second">>], [maps:get(<<"reason">>, R) || R <- Reports]),
+    ?assertEqual(<<"manual">>, maps:get(<<"source">>, hd(Reports))),
+
+    nh_agent:stop(Agent).
+
+%% A crash `nh_logger' sees is reported without the application doing anything.
+a_crash_logged_is_reported_test() ->
+    {Agent, _Ref, _} = join_with_reports(#{}),
+
+    Format = "=CRASH REPORT====\n   initial call: ~s:~s/~B ~p ~p ~w ~B ~w ~B ~B ~p\n",
+    Args = [worker, init, 1, self(), {exit, {connect_error, nxdomain}}, [], 0, [], 1, 1, []],
+    ok = nh_logger:log(
+        #{level => error, msg => {Format, Args}, timestamp => erlang:system_time(microsecond)},
+        #{agent => Agent}
+    ),
+    #{<<"reports">> := [Report]} = wait_for_event(<<"error_reports:report">>, 2000),
+    ?assertEqual(<<"exit">>, maps:get(<<"kind">>, Report)),
+    ?assertEqual(<<"{connect_error,nxdomain}">>, maps:get(<<"reason">>, Report)),
+
+    nh_agent:stop(Agent).
+
+%% Without the extension enabled, a crash is only a log line.
+reports_are_dropped_without_the_extension_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 60000}, [<<"logging">>], reports_advert()
+    ),
+    ok = nerves_hub_link:report_error(Agent, error, unseen, #{}),
+    ?assertEqual(nothing_sent, next_sent(1500)),
+
+    nh_agent:stop(Agent).
+
+%% A crash loop keeps the newest reports and says how many went.
+a_full_report_buffer_drops_the_oldest_test() ->
+    {Agent, _Ref, _} = join_with_reports(#{report_buffer => 2}),
+
+    [ok = nerves_hub_link:report_error(Agent, error, N, #{}) || N <- [one, two, three]],
+    #{<<"reports">> := [Notice | Reports]} = wait_for_event(<<"error_reports:report">>, 2000),
+    ?assertEqual(<<"dropped 1 reports">>, maps:get(<<"reason">>, Notice)),
+    ?assertEqual([<<"two">>, <<"three">>], [maps:get(<<"reason">>, R) || R <- Reports]),
+
+    nh_agent:stop(Agent).
+
+%% A crash while the socket is down is the one most worth seeing.
+reports_held_while_disconnected_go_on_attach_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(config(#{extensions => [error_reports]})),
+    _ = next_opened(),
+    ok = nerves_hub_link:report_error(Agent, panic, before_connecting, #{}),
+
+    Agent ! {websocket, fake_handle, connected},
+    [DeviceJoinRef, DeviceRef, _, _, _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, DeviceJoinRef, DeviceRef, <<"device">>),
+    _Interface = wait_for_event(<<"report_network_interface">>, 1000),
+    send_device(Agent, DeviceJoinRef, <<"extensions:get">>, reports_advert()),
+    [ExtJoinRef, ExtRef, _, _, _] = json:decode(next_sent(1000)),
+    Frame = json:encode([
+        ExtJoinRef,
+        ExtRef,
+        <<"extensions">>,
+        <<"phx_reply">>,
+        #{<<"status">> => <<"ok">>, <<"response">> => [<<"error_reports">>]}
+    ]),
+    Agent ! {websocket, fake_handle, {text, iolist_to_binary(Frame)}},
+
+    #{<<"reports">> := [Report]} = wait_for_event(<<"error_reports:report">>, 1000),
+    ?assertEqual(<<"before_connecting">>, maps:get(<<"reason">>, Report)),
+
+    nh_agent:stop(Agent).
+
 %% An error may be the last thing a device says: it does not wait for the timer.
 an_error_line_goes_at_once_test() ->
     {Agent, _Ref, _} = join_with_extensions(

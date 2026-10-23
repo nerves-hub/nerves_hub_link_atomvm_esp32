@@ -452,9 +452,10 @@ restart the device every time it connected.
 
 ## Extensions
 
-`extensions => all` attaches the four NervesHub extensions: `health` reports
-memory and uptime, `geo` reports a location, `logging` carries log lines, and
-`alarms` sends the application's alarms as they are raised and cleared.
+`extensions => all` attaches the five NervesHub extensions: `health` reports
+memory and uptime, `geo` reports a location, `logging` carries log lines,
+`alarms` sends the application's alarms as they are raised and cleared, and
+`error_reports` sends crashes as structured reports.
 
 After the device joins, NervesHub says which versions of each it speaks and the
 device joins with the newest both know. An operator can turn one off or on
@@ -526,6 +527,30 @@ set holding both sends only one of them.
 `alarms_interval_ms`. Keep it quick: while it runs, the agent sends no
 heartbeat and reads no frame. It must not call `nerves_hub_link`, whose calls
 go to the agent and would wait on themselves until they time out.
+
+### Error reports
+
+With `error_reports`, every crash `nh_logger` sees -- the crash report
+`proc_lib` logs when a process exits abnormally -- also goes to NervesHub as a
+report: kind, reason, frames and the device's free heap at that moment. The
+platform groups reports of one bug into one issue and keeps them for 30 days,
+where a log line is text kept for three. `nh_logger` has to be a `logger`
+handler for this, as it is for logging.
+
+An error the application caught and still wants seen goes with
+`nerves_hub_link:report_error/4`:
+
+```erlang
+nerves_hub_link:report_error(nerves_hub_link, error, {timeout, 5000}, #{
+    context => #{queue => uploads},
+    fingerprint => <<"payment-gateway">>
+}).
+```
+
+Reports are held, up to `report_buffer` (10 by default, the oldest dropped and
+the drop reported), and sent in a batch at most once a second, NervesHub's
+rate. Held through a disconnect, they go as soon as the extension is attached
+again. NervesHub has the extension off by default; turn it on for the product.
 
 ## Describing the firmware
 

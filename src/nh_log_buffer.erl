@@ -12,24 +12,42 @@
 %%
 %% A drop is not silent. The next batch taken starts with a line saying how many
 %% went, so a gap in the log reads as a gap rather than as a quiet device.
+%%
+%% Error reports are held the same way (`new/2'), with a report of their own
+%% saying how many went.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_log_buffer).
 
--export([new/1, add/2, take/2, take/3, size/1, dropped/1]).
+-export([new/1, new/2, add/2, take/2, take/3, size/1, dropped/1]).
+
+-type notice() :: fun((pos_integer()) -> {ok, map()} | {error, no_clock}).
 
 -opaque buffer() :: #{
     lines := queue:queue(map()),
     count := non_neg_integer(),
     max := pos_integer(),
-    dropped := non_neg_integer()
+    dropped := non_neg_integer(),
+    notice := notice()
 }.
 
 -export_type([buffer/0]).
 
+%%-----------------------------------------------------------------------------
+%% @equiv new(Max, fun nh_ext_logs:dropped_line/1)
+%% @end
+%%-----------------------------------------------------------------------------
 -spec new(pos_integer()) -> buffer().
-new(Max) when is_integer(Max), Max > 0 ->
-    #{lines => queue:new(), count => 0, max => Max, dropped => 0}.
+new(Max) -> new(Max, fun nh_ext_logs:dropped_line/1).
+
+%%-----------------------------------------------------------------------------
+%% @doc A buffer of at most `Max' entries. `Notice' builds the entry saying how
+%% many were dropped, or `{error, no_clock}' when there is no time to stamp it.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec new(pos_integer(), notice()) -> buffer().
+new(Max, Notice) when is_integer(Max), Max > 0, is_function(Notice, 1) ->
+    #{lines => queue:new(), count => 0, max => Max, dropped => 0, notice => Notice}.
 
 %%-----------------------------------------------------------------------------
 %% @doc Add a line, dropping the oldest when full.
@@ -63,8 +81,8 @@ take(N, Buffer) -> take(N, infinity, Buffer).
 %% @end
 %%-----------------------------------------------------------------------------
 -spec take(pos_integer(), pos_integer() | infinity, buffer()) -> {[map()], buffer()}.
-take(N, MaxBytes, #{dropped := Dropped} = Buffer) when Dropped > 0 ->
-    case nh_ext_logs:dropped_line(Dropped) of
+take(N, MaxBytes, #{dropped := Dropped, notice := MakeNotice} = Buffer) when Dropped > 0 ->
+    case MakeNotice(Dropped) of
         {ok, Notice} ->
             {Lines, Rest} = take(N - 1, MaxBytes, Buffer#{dropped => 0}),
             {[Notice | Lines], Rest};

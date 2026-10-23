@@ -7,6 +7,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The `error_reports` extension (0.1.0): with `extensions => [error_reports]`,
+  each crash report `proc_lib` logs goes to NervesHub as a structured report
+  (kind, reason, frames, and free heap in `context`), grouped by the platform
+  into issues. `nerves_hub_link:report_error/4` reports an error the
+  application caught. Reports are held up to `report_buffer` (10) and sent in
+  batches at most once a second; a drop is reported.
 - `network_interface` may be a function, asked on each join and download,
   for a device that moves between networks without restarting the agent.
 - `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,

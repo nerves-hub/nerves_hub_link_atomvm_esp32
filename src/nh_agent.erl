@@ -87,6 +87,14 @@
 %% ignored with `{update_ignored, armed}' to the owner, `apply_update/2' with
 %% `{update_decision_ignored, armed}', and `request_update/1' is answered
 %% `{error, armed}'.
+%%
+%% == Error reports ==
+%%
+%% With the `error_reports' extension enabled, a crash `nh_logger' sees, and a
+%% `nerves_hub_link:report_error/4', is held (at most `report_buffer', 10 by
+%% default, the oldest dropped first and the drop reported) and sent in a batch
+%% at most once a second, NervesHub's rate; see `nh_ext_error_reports'. Held
+%% through a disconnect, they go when the extension is attached again.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_agent).
@@ -110,6 +118,7 @@
 
 -define(EXTENSIONS, <<"extensions">>).
 -define(LOGGING, <<"logging">>).
+-define(ERROR_REPORTS, <<"error_reports">>).
 
 %% Long enough for a frame to leave the socket, short enough that an operator
 %% does not notice.
@@ -139,6 +148,12 @@
 %% message per error line in a crash loop would lose most of them.
 -define(URGENT_LOG_GAP_MS, 250).
 -define(DEFAULT_LOG_BUFFER, 100).
+%% NervesHub takes one error_reports message a second; a crash loop past that
+%% is in the batch, not in more messages.
+-define(REPORT_FLUSH_MS, 1000).
+%% Few, because each one is a crash report of a few hundred bytes and a crash
+%% loop is what fills it: the newest say as much as the rest would.
+-define(DEFAULT_REPORT_BUFFER, 10).
 -define(DEFAULT_NETWORK_INTERFACE, <<"wlan0">>).
 -define(DEFAULT_TRIAL, #{boot_attempts => 3, join_timeout_ms => 300000}).
 %% Console output goes up in pieces of at most this many bytes (`nh_console:chunks/2').
@@ -189,6 +204,7 @@
     download_idle_ms => pos_integer(),
     download_resume_after_ms => pos_integer(),
     download_resumes => pos_integer(),
+    report_buffer => pos_integer(),
     keep_open_above => non_neg_integer() | never,
     before_update => fun(() -> ok),
     update_retry_backoff => {pos_integer(), pos_integer()}
@@ -280,6 +296,10 @@ init(Config, Owner) ->
         %% Status updates made while the socket was closed for a download.
         deferred => [],
         log_buffer => nh_log_buffer:new(maps:get(log_buffer, Config, ?DEFAULT_LOG_BUFFER)),
+        report_buffer => nh_log_buffer:new(
+            maps:get(report_buffer, Config, ?DEFAULT_REPORT_BUFFER),
+            fun nh_ext_error_reports:dropped/1
+        ),
         ext_refs => [],
         heartbeat_ms => maps:get(heartbeat_ms, Config, ?DEFAULT_HEARTBEAT_MS),
         reconnect_attempt => 0,
@@ -405,7 +425,7 @@ disconnect(#{transport := Transport, handle := Handle} = State0) ->
     State2 = lists:foldl(
         fun cancel_timer/2,
         State1,
-        [heartbeat, connect_timeout, extensions_fallback, log_flush]
+        [heartbeat, connect_timeout, extensions_fallback, log_flush, report_flush]
     ),
     State2#{
         handle => undefined,
@@ -445,6 +465,8 @@ fire(log_flush, State) ->
     flush_logs(State);
 fire(urgent_log_gap, State) ->
     urgent_flush(State);
+fire(report_flush, State) ->
+    flush_reports(State);
 fire(trial_deadline, State) ->
     trial_expired(State);
 fire(update_idle, State) ->
@@ -538,10 +560,10 @@ handle_event({joined, <<"device">>, Response}, State) ->
 handle_event({joined, ?EXTENSIONS, Response}, State) ->
     {Extensions, Actions} = nh_extensions:attach(Response, maps:get(extensions, State)),
     notify(State, {extensions_attached, nh_extensions:attached(Extensions)}),
-    flush_logs(run_extension_actions(Actions, State#{extensions => Extensions}));
+    flush_held(run_extension_actions(Actions, State#{extensions => Extensions}));
 handle_event({message, ?EXTENSIONS, Event, Payload}, State) ->
     {Extensions, Actions} = nh_extensions:handle_event(Event, Payload, maps:get(extensions, State)),
-    flush_logs(run_extension_actions(Actions, State#{extensions => Extensions}));
+    flush_held(run_extension_actions(Actions, State#{extensions => Extensions}));
 handle_event({reply, ?EXTENSIONS, Ref, <<"error">>, <<"detach">>}, State) ->
     extension_refused(Ref, State);
 handle_event({joined, <<"console">>, _Response}, State) ->
@@ -1358,6 +1380,16 @@ extension_out(<<"logging:send">>, Line, State) ->
                     maybe_flush_logs(Line, State#{log_buffer => Buffer})
             end
     end;
+%% Error reports are held like batched log lines, and dropped unless the
+%% extension is enabled: `nh_logger' sends every crash here regardless.
+extension_out(<<"error_reports:report">>, Report, State) ->
+    case lists:member(?ERROR_REPORTS, nh_extensions:enabled(maps:get(extensions, State))) of
+        false ->
+            State;
+        true ->
+            Buffer = nh_log_buffer:add(Report, maps:get(report_buffer, State)),
+            arm_report_flush(State#{report_buffer => Buffer})
+    end;
 extension_out(Event, Payload, State) ->
     push_extension(Event, Payload, State).
 
@@ -1424,6 +1456,40 @@ arm_log_flush(#{timers := Timers, config := Config} = State) ->
     case Waiting andalso Attached andalso not is_map_key(log_flush, Timers) of
         true -> set_timer(log_flush, maps:get(log_flush_ms, Config, ?DEFAULT_LOG_FLUSH_MS), State);
         false -> State
+    end.
+
+%% Lines and reports held while the extensions were not attached.
+flush_held(State) ->
+    flush_reports(flush_logs(State)).
+
+arm_report_flush(#{timers := Timers} = State) ->
+    Waiting = nh_log_buffer:size(maps:get(report_buffer, State)) > 0,
+    Attached = nh_extensions:is_attached(?ERROR_REPORTS, maps:get(extensions, State)),
+    case Waiting andalso Attached andalso not is_map_key(report_flush, Timers) of
+        true -> set_timer(report_flush, ?REPORT_FLUSH_MS, State);
+        false -> State
+    end.
+
+%% One batch, bounded in bytes as a log batch is, and the rest a second later:
+%% the rate NervesHub takes them at.
+flush_reports(State0) ->
+    State = cancel_timer(report_flush, State0),
+    Buffer = maps:get(report_buffer, State),
+    Attached = nh_extensions:is_attached(?ERROR_REPORTS, maps:get(extensions, State)),
+    Waiting = nh_log_buffer:size(Buffer) > 0 orelse nh_log_buffer:dropped(Buffer) > 0,
+    case Attached andalso Waiting of
+        false ->
+            State;
+        true ->
+            {Reports, Rest} = nh_log_buffer:take(
+                nh_ext_error_reports:max_batch(), nh_ext_logs:max_batch_bytes(), Buffer
+            ),
+            State1 = push_extension(
+                nh_ext_error_reports:event(),
+                nh_ext_error_reports:batch(Reports),
+                State#{report_buffer => Rest}
+            ),
+            arm_report_flush(State1)
     end.
 
 %% Sends what is waiting, if logging is attached to send it on. Called on the

@@ -41,12 +41,14 @@ unknown_extensions_are_dropped_test() ->
 available_declares_a_version_per_extension_test() ->
     Available = nh_extensions:available(all_enabled()),
     ?assertEqual(
-        [<<"alarms">>, <<"geo">>, <<"health">>, <<"logging">>], lists:sort(maps:keys(Available))
+        [<<"alarms">>, <<"error_reports">>, <<"geo">>, <<"health">>, <<"logging">>],
+        lists:sort(maps:keys(Available))
     ),
     ?assertEqual(<<"0.1.0">>, maps:get(<<"alarms">>, Available)),
+    ?assertEqual(<<"0.1.0">>, maps:get(<<"error_reports">>, Available)),
     lists:foreach(
         fun(V) -> ?assertEqual(<<"0.0.1">>, V) end,
-        maps:values(maps:remove(<<"alarms">>, Available))
+        maps:values(maps:without([<<"alarms">>, <<"error_reports">>], Available))
     ).
 
 %% The platform decides what is on; a product may have an extension switched off.
@@ -161,10 +163,10 @@ attach_all_means_everything_offered_test() ->
         <<"attach">>, #{<<"extensions">> => <<"all">>}, State0
     ),
     ?assertEqual(
-        [<<"alarms">>, <<"geo">>, <<"health">>, <<"logging">>],
+        [<<"alarms">>, <<"error_reports">>, <<"geo">>, <<"health">>, <<"logging">>],
         lists:sort(nh_extensions:attached(State))
     ),
-    ?assertEqual(4, length(Actions)).
+    ?assertEqual(5, length(Actions)).
 
 detach_confirms_and_stops_test() ->
     {State, Actions} = nh_extensions:handle_event(
@@ -185,7 +187,8 @@ disconnecting_detaches_everything_test() ->
     ?assertEqual([], nh_extensions:attached(State)),
     ?assertEqual(undefined, nh_extensions:version(<<"health">>, State)),
     ?assertEqual(
-        [<<"health">>, <<"geo">>, <<"logging">>, <<"alarms">>], nh_extensions:enabled(State)
+        [<<"health">>, <<"geo">>, <<"logging">>, <<"alarms">>, <<"error_reports">>],
+        nh_extensions:enabled(State)
     ).
 
 %% ------------------------------------------------------------------- alarms

@@ -241,6 +241,7 @@
 -export([update_progress/2, update_progress/3, firmware_validated/1, update_failed/2]).
 -export([push/3]).
 -export([send_log/3, send_log/4]).
+-export([report_error/4]).
 -export([check_for_update/1, request_update/1, set_update_mode/2, update_mode/1]).
 -export([flush_logs/2]).
 -export([apply_update/2, ignore_update/2, reschedule_update/3]).
@@ -328,6 +329,26 @@ send_log(Pid, Level, Message, Meta) ->
     case nh_ext_logs:line(Level, Message, Meta) of
         {ok, Line} ->
             Pid ! {push_extension, nh_ext_logs:event(), Line},
+            ok;
+        {error, _} = Error ->
+            Error
+    end.
+
+%%-----------------------------------------------------------------------------
+%% @doc Report an error to NervesHub, if the error_reports extension is enabled.
+%%
+%% For an error the application caught and handled but still wants seen.
+%% `Kind' and `Reason' are any terms; `Opts' may give `stacktrace', `context'
+%% (a map, sent as text) and `fingerprint', to group reports by something the
+%% stacktrace does not show. Crashes are reported without this, by `nh_logger'.
+%% `{error, no_clock}' as for `send_log/4'.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec report_error(pid() | atom(), term(), term(), map()) -> ok | {error, no_clock}.
+report_error(Agent, Kind, Reason, Opts) ->
+    case nh_ext_error_reports:manual(Kind, Reason, Opts) of
+        {ok, Report} ->
+            Agent ! {push_extension, nh_ext_error_reports:event(), Report},
             ok;
         {error, _} = Error ->
             Error
