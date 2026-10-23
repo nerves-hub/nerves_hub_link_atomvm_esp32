@@ -144,7 +144,9 @@
 %% process and everything it starts afterwards print is forwarded as well as
 %% shown on the console. The text arrives unstructured, at one level, timed on
 %% arrival -- there is no level or module in an `io:format' call to carry over.
-%% ESP-IDF's own `I (1234) wifi: ...' lines are written from C and are not
+%% With `register', the capture sends to that name and is registered itself as
+%% `nh_io_capture': an agent started again under the name reuses it rather than
+%% leaving a capture behind per restart. ESP-IDF's own `I (1234) wifi: ...' lines are written from C and are not
 %% caught by anything here.
 %%
 %% One thing to change when turning it on: `logger' runs its handlers in the
@@ -478,12 +480,27 @@ with_agent_config(Config, Start) ->
 capture_io(Config, Agent) ->
     case maps:get(capture_io, Config, false) of
         false -> ok;
-        true -> capture(#{agent => Agent});
-        Options when is_map(Options) -> capture(Options#{agent => Agent})
+        true -> capture(#{}, Config, Agent);
+        Options when is_map(Options) -> capture(Options, Config, Agent)
     end.
 
-capture(Options) ->
-    {ok, Capture} = nh_io_capture:start(Options),
+%% A registered agent is captured by its name, through one capture for the
+%% device. An agent started again under the same name finds it there, so the
+%% processes that inherited it keep reaching the new agent, and no capture is
+%% left behind sending to a dead one.
+capture(Options, #{register := Name}, _Agent) ->
+    Capture =
+        case whereis(nh_io_capture) of
+            undefined ->
+                {ok, Pid} = nh_io_capture:start(Options#{agent => Name}),
+                true = register(nh_io_capture, Pid),
+                Pid;
+            Pid ->
+                Pid
+        end,
+    nh_io_capture:attach(Capture);
+capture(Options, _Config, Agent) ->
+    {ok, Capture} = nh_io_capture:start(Options#{agent => Agent}),
     nh_io_capture:attach(Capture).
 
 validate(Config) ->

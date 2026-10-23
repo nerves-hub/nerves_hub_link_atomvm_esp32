@@ -5,6 +5,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `capture_io` with `register` captures by the name, through one capture
+  registered as `nh_io_capture`. An agent started again under the name used to
+  get a new capture each time, and the old one stayed alive sending to the dead
+  agent, along with every process that had inherited it.
+
 ## [0.2.0] - 2026-09-24
 
 Upgrading changes what a device does by default. **Changed** lists what to

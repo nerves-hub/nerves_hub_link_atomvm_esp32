@@ -178,6 +178,39 @@ a_taken_name_is_refused_test() ->
     true = unregister(Name),
     exit(Squatter, kill).
 
+%% An agent restarted under the same name -- the application's way out of a
+%% connection that will not come back -- keeps the one capture, so nothing is
+%% left behind per restart and what was started before it still reaches the new
+%% agent. Run from its own process: the capture becomes the caller's group
+%% leader, and eunit's must stay its own.
+a_restarted_registered_agent_keeps_its_capture_test() ->
+    setup(),
+    Name = list_to_atom("nh_cap_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    Test = self(),
+    Config = config(#{firmware => none, register => Name, capture_io => #{echo => false}}),
+    Starter = spawn(fun() ->
+        {ok, First} = nerves_hub_link:start(Config),
+        Leader = group_leader(),
+        Ref = monitor(process, First),
+        ok = nerves_hub_link:stop(First),
+        receive
+            {'DOWN', Ref, process, First, _} -> ok
+        end,
+        {ok, Second} = nerves_hub_link:start(Config),
+        Test ! {started, Leader, group_leader(), Second}
+    end),
+
+    receive
+        {started, Leader, Again, Agent} ->
+            ?assertEqual(Leader, Again),
+            ?assertEqual(Leader, whereis(nh_io_capture)),
+            ok = nerves_hub_link:stop(Agent),
+            ok = nh_io_capture:stop(Leader)
+    after 2000 ->
+        exit(Starter, kill),
+        erlang:error(no_restart)
+    end.
+
 explicit_none_is_allowed_test() ->
     setup(),
     {ok, Pid} = nerves_hub_link:start(config(#{firmware => none})),
