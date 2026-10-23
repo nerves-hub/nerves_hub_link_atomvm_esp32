@@ -63,11 +63,6 @@
 %% and a chunky download does not turn into hundreds of tiny writes.
 -define(BLOCK_SIZE, 4096).
 
-%% How many times a download is tried again after the first attempt fails, and
-%% how long to wait between: from the first delay, doubling to the second.
--define(DEFAULT_MAX_RETRIES, 5).
--define(DEFAULT_RETRY_BACKOFF, {2000, 30000}).
-
 -type update_result() :: {ok, binary()} | {error, term()}.
 
 %% The three things here that only exist on a device: flash and NVS through
@@ -119,12 +114,11 @@ apply_update(Payload) -> apply_update(Payload, #{}).
 %% <ul>
 %%   <li>`progress', a function of one argument, called with a percentage as
 %%       the download proceeds</li>
-%%   <li>`started', a function of none, called as each attempt begins</li>
+%%   <li>`started', a function of none, called as each connection begins</li>
+%%   <li>`resumed', a function of one argument, called with the byte a
+%%       download resumed from</li>
+%%   <li>`resume_after_ms' and `resumes' (see `recv_loop/2')</li>
 %%   <li>`slot', to override the target</li>
-%%   <li>`max_retries', how many times to try again after the first attempt
-%%       fails, 5 by default</li>
-%%   <li>`retry_backoff', `{FirstMs, MaxMs}' between attempts, `{2000, 30000}'
-%%       by default</li>
 %% </ul>
 %% @end
 %%-----------------------------------------------------------------------------
@@ -184,126 +178,178 @@ fetch(Slot, Parsed, Size, Checksum, Progress, Opts) ->
         slot => Slot,
         keys => maps:get(keys, Opts, []),
         opts => Opts,
+        url => Parsed,
         offset => 0,
         written => 0,
+        received => 0,
+        resumes => 0,
+        since => 0,
+        stuck => 0,
         buffer => <<>>,
         hash => crypto:hash_init(sha256),
         size => Size,
         progress => Progress,
-        reported => -1,
-        status => undefined,
-        retries => 0
+        reported => -1
     },
-    finish(download(Parsed, State), Slot, Checksum, Opts).
+    finish(recv_loop(start_reader(State), State), Slot, Checksum, Opts).
 
-%% One attempt after another until the archive is in, a failure that another
-%% attempt would not fix, or the retries run out.
+%% == Resuming ==
 %%
-%% A retry carries on from the last byte received rather than starting again:
-%% the hash is kept as it was, so the bytes a `Range' request returns extend
-%% the same digest. On a device a download is the longest a socket is held
-%% open, and restarting a few hundred kilobytes over a weak link because the
-%% last few failed is how an update never finishes.
-download(Parsed, #{retries := Retries, opts := Opts} = State) ->
-    case attempt(Parsed, State) of
-        {complete, Final} ->
-            flush(Final);
-        {retry, Reason, Next} ->
-            Max = maps:get(max_retries, Opts, ?DEFAULT_MAX_RETRIES),
-            case Retries < Max of
-                true ->
-                    _ = timer:sleep(retry_delay(Retries, Opts)),
-                    download(Parsed, Next#{retries => Retries + 1});
-                false ->
-                    {error, {download_failed, Reason}}
+%% A connection can stop carrying data and never say so: over a cellular modem
+%% the last bytes of a download sometimes never arrive, and AtomVM's
+%% `ssl:recv/2' has no deadline. So the connection is read by a process of its
+%% own, one batch at a time, and this one waits for each batch with a deadline,
+%% `resume_after_ms' (10 s by default). On a connection that went quiet, failed
+%% or closed short it reconnects and asks for the rest, `Range: bytes=N-',
+%% telling `resumed' the byte it resumed from. It gives up once `resumes'
+%% connections in a row (3 by default) brought no new byte: one that brought
+%% any starts the count again, since a slow link can take several connections
+%% to carry an archive. After one that brought nothing it waits before the
+%% next, `resume_after_ms' times the count: a modem with no route for a few
+%% seconds fails every connect at once, and would otherwise spend all of
+%% `resumes' in a fraction of a second. The sha256 at the end still covers the
+%% whole archive.
+%% The reader is stopped before the next one connects: a board without PSRAM
+%% may have room for one TLS session, not two.
+-define(RESUME_AFTER_MS, 10000).
+-define(RESUMES, 3).
+
+recv_loop({Reader, _Monitor} = R, #{opts := Opts} = State) ->
+    receive
+        {?MODULE, Reader, {responses, Responses}} ->
+            case handle(Responses, State) of
+                {done, Final} ->
+                    stop_reader(R),
+                    flush(Final);
+                {continue, Next} ->
+                    Reader ! {?MODULE, self(), more},
+                    recv_loop(R, Next);
+                %% A server error may pass; another connection is worth it.
+                {retry, Error} ->
+                    resume(R, Error, State);
+                {error, _} = Error ->
+                    stop_reader(R),
+                    Error
             end;
-        {error, _} = Error ->
+        %% Passive mode reports a peer close as an error even when the response
+        %% was complete, which is how a body with no length ends. One that
+        %% knows its length and is short of it was cut.
+        {?MODULE, Reader, closed} ->
+            case State of
+                #{size := Size, received := Received} when Received < Size ->
+                    resume(R, {error, {stream_failed, closed}}, State);
+                _ ->
+                    stop_reader(R),
+                    flush(State)
+            end;
+        {?MODULE, Reader, {error, _} = Error} ->
+            resume(R, Error, State)
+    after maps:get(resume_after_ms, Opts, ?RESUME_AFTER_MS) ->
+        resume(R, {error, download_stalled}, State)
+    end.
+
+resume(R, Error, State) ->
+    #{opts := Opts, resumes := Resumes, received := Received, since := Since, stuck := Stuck} =
+        State,
+    stop_reader(R),
+    Stuck1 =
+        case Received > Since of
+            true -> 0;
+            false -> Stuck + 1
+        end,
+    case Stuck1 < maps:get(resumes, Opts, ?RESUMES) of
+        true ->
+            _ = (maps:get(resumed, Opts, fun(_Offset) -> ok end))(Received),
+            _ = timer:sleep(Stuck1 * maps:get(resume_after_ms, Opts, ?RESUME_AFTER_MS)),
+            Next = State#{resumes => Resumes + 1, since => Received, stuck => Stuck1},
+            recv_loop(start_reader(Next), Next);
+        false ->
             Error
     end.
 
-retry_delay(Retries, Opts) ->
-    {Min, Max} = maps:get(retry_backoff, Opts, ?DEFAULT_RETRY_BACKOFF),
-    nh_backoff:delay(Retries, Min, Max).
+%% Linked, so it goes with the download if the agent stops that; monitored, so
+%% the next one connects only once this one is gone.
+start_reader(#{url := Url, received := Received, resumes := Resumes, opts := Opts}) ->
+    Owner = self(),
+    Headers =
+        case Resumes of
+            0 -> [];
+            _ -> [{<<"Range">>, <<"bytes=", (integer_to_binary(Received))/binary, "-">>}]
+        end,
+    _ = (maps:get(started, Opts, fun() -> ok end))(),
+    Reader = spawn_link(fun() -> reader(Owner, Url, Headers, http(Opts)) end),
+    {Reader, monitor(process, Reader)}.
 
-attempt(
-    #{protocol := Protocol, host := Host, port := Port, path := Path},
-    #{opts := Opts} = State
-) ->
-    Http = http(Opts),
-    Started = maps:get(started, Opts, fun() -> ok end),
-    _ = Started(),
+%% One that is waiting on a quiet connection hears nothing, so it is killed;
+%% its socket goes with it.
+stop_reader({Reader, Monitor}) ->
+    unlink(Reader),
+    exit(Reader, kill),
+    receive
+        {'DOWN', Monitor, process, Reader, _} -> ok
+    end,
+    receive
+        {?MODULE, Reader, _} -> ok
+    after 0 -> ok
+    end.
 
+reader(Owner, #{protocol := Protocol, host := Host, port := Port, path := Path}, Headers, Http) ->
     %% Passive because AtomVM's `ssl' asserts `{active, false}', and verified
     %% against the bundled CAs. A tampered archive is refused regardless:
     %% `finish/4' checks the sha256 NervesHub sent over the device socket.
     case Http:connect(Protocol, Host, Port, [{active, false}, {verify, verify_peer}]) of
         {ok, Conn} ->
-            case Http:request(Conn, <<"GET">>, Path, range(State), undefined) of
+            case Http:request(Conn, <<"GET">>, Path, Headers, undefined) of
                 {ok, Conn2, _Ref} ->
-                    Result = recv_loop(Conn2, State#{status => undefined}),
-                    _ = Http:close(Conn2),
-                    Result;
+                    read(Owner, Conn2, Http);
                 {error, Reason} ->
                     _ = Http:close(Conn),
-                    {retry, {request_failed, Reason}, State}
+                    Owner ! {?MODULE, self(), {error, {request_failed, Reason}}}
             end;
         {error, Reason} ->
-            {retry, {connect_failed, Reason}, State}
+            Owner ! {?MODULE, self(), {error, {connect_failed, Reason}}}
     end.
 
-%% Everything received so far, whether written yet or still buffered.
-received(#{offset := Offset, buffer := Buffer}) -> Offset + byte_size(Buffer).
-
-range(State) ->
-    case received(State) of
-        0 -> [];
-        From -> [{<<"Range">>, <<"bytes=", (integer_to_binary(From))/binary, "-">>}]
-    end.
-
-recv_loop(Conn, #{opts := Opts} = State) ->
-    Http = http(Opts),
-
+%% A batch at a time: the next is read once the last is written, so a fast
+%% link does not pile the archive up in a mailbox.
+read(Owner, Conn, Http) ->
     case Http:recv(Conn, 0) of
         {ok, Conn2, Responses} ->
-            case handle(Responses, State) of
-                {done, Final} -> ended(Final, done);
-                {continue, Next} -> recv_loop(Conn2, Next);
-                Other -> Other
+            Owner ! {?MODULE, self(), {responses, Responses}},
+            receive
+                {?MODULE, Owner, more} -> read(Owner, Conn2, Http)
             end;
-        %% Passive mode reports a peer close as an error even when the response
-        %% was complete, which is how a body with no length ends.
         {error, {_Transport, closed}} ->
-            ended(State, closed);
+            Owner ! {?MODULE, self(), closed};
         {error, Reason} ->
-            {retry, {stream_failed, Reason}, State}
+            Owner ! {?MODULE, self(), {error, {stream_failed, Reason}}}
     end.
 
-%% The response ended. Whether that was the whole archive is a question for the
-%% size NervesHub sent, not for the socket: a connection that drops cleanly
-%% halfway looks exactly like one that finished.
-ended(#{status := undefined} = State, How) ->
-    {retry, {no_response, How}, State};
-ended(#{size := Size} = State, How) when is_integer(Size) ->
-    case received(State) of
-        Received when Received < Size -> {retry, {incomplete, How, Received}, State};
-        _ -> {complete, State}
-    end;
-ended(State, _How) ->
-    {complete, State}.
-
+%% A resumed request answers 206 with the rest. 200 is all of it: a server that
+%% ignores `Range' is allowed to, and the only thing to do is start again,
+%% erasing first, since flash can only be written once between erases.
 handle([], State) ->
     {continue, State};
-handle([{status, _Ref, Status} | Rest], State) ->
-    case status(Status, State) of
-        {ok, Next} -> handle(Rest, Next);
-        Other -> Other
+handle([{status, _Ref, Status} | Rest], #{resumes := Resumes} = State) ->
+    case {Status, Resumes} of
+        {200, 0} ->
+            handle(Rest, State);
+        {206, N} when N > 0 ->
+            handle(Rest, State);
+        {200, _} ->
+            case restart(State) of
+                {ok, Next} -> handle(Rest, Next);
+                {error, _} = Error -> Error
+            end;
+        _ when Status >= 500 ->
+            {retry, {error, {http_status, Status}}};
+        _ ->
+            {error, {http_status, Status}}
     end;
 handle([{header, _Ref, _Header} | Rest], State) ->
     handle(Rest, State);
 handle([{trailer_header, _Ref, _Header} | Rest], State) ->
     handle(Rest, State);
-handle([{data, _Ref, _Chunk} | _Rest], #{status := undefined} = State) ->
-    {retry, body_before_status, State};
 handle([{data, _Ref, Chunk} | Rest], State) ->
     case write(Chunk, State) of
         {ok, Next} -> handle(Rest, Next);
@@ -312,30 +358,14 @@ handle([{data, _Ref, Chunk} | Rest], State) ->
 handle([{done, _Ref} | _Rest], State) ->
     {done, State}.
 
-%% 206 is the rest of the archive from where the last attempt stopped. 200 is
-%% all of it: a server that ignores `Range' is allowed to, and the only thing
-%% to do is start again — erasing first, since flash can only be written once
-%% between erases. A 5xx may pass; anything else in the 4xx range will not,
-%% and asking again only delays saying so.
-status(206, State) ->
-    {ok, State#{status => 206}};
-status(200, State) ->
-    case received(State) of
-        0 -> {ok, State#{status => 200}};
-        _Some -> restart(State)
-    end;
-status(Status, State) when Status >= 500 ->
-    {retry, {http_status, Status}, State};
-status(Status, _State) ->
-    {error, {http_status, Status}}.
-
 restart(#{slot := Slot, size := Size, opts := Opts} = State) ->
     case erase(Slot, Size, Opts) of
         ok ->
             {ok, State#{
-                status => 200,
                 offset => 0,
                 written => 0,
+                received => 0,
+                since => 0,
                 buffer => <<>>,
                 hash => crypto:hash_init(sha256)
             }};
@@ -346,9 +376,11 @@ restart(#{slot := Slot, size := Size, opts := Opts} = State) ->
 %% Buffer to a block, write whole blocks, keep the remainder. The hash covers
 %% the bytes as they arrive, so it catches corruption in flight rather than
 %% re-reading what was just written.
-write(Chunk, #{buffer := Buffer, hash := Hash} = State) ->
+write(Chunk, #{buffer := Buffer, hash := Hash, received := Received} = State) ->
     Combined = <<Buffer/binary, Chunk/binary>>,
-    Next = State#{hash => crypto:hash_update(Hash, Chunk)},
+    Next = State#{
+        hash => crypto:hash_update(Hash, Chunk), received => Received + byte_size(Chunk)
+    },
     case emit_blocks(Combined, Next) of
         {ok, Emitted} -> {ok, report(Emitted)};
         {error, _} = Error -> Error
@@ -624,8 +656,9 @@ boot_attempts(Opts) ->
 %%
 %% The download takes as long as it takes, and the agent has heartbeats to send
 %% while it runs — so it does not run on the agent's process. The caller
-%% receives `{nh_ota, self(), started}' each time a download attempt begins,
-%% `{nh_ota, self(), {progress, Percent}}' as it goes and
+%% receives `{nh_ota, self(), started}' each time a connection begins,
+%% `{nh_ota, self(), {progress, Percent}}' as it goes,
+%% `{nh_ota, self(), {resumed, Offset}}' for each resume (see `recv_loop/2'), and
 %% `{nh_ota, self(), Result}' at the end.
 %% @end
 %%-----------------------------------------------------------------------------
@@ -647,9 +680,12 @@ start_update(Payload, Owner, Opts) ->
             Self = self(),
             Progress = fun(Percent) -> Owner ! {nh_ota, Self, {progress, Percent}} end,
             Started = fun() -> Owner ! {nh_ota, Self, started} end,
+            Resumed = fun(Offset) -> Owner ! {nh_ota, Self, {resumed, Offset}} end,
             Owner !
                 {nh_ota, Self,
-                    apply_update(Payload, Opts#{progress => Progress, started => Started})}
+                    apply_update(Payload, Opts#{
+                        progress => Progress, started => Started, resumed => Resumed
+                    })}
         end),
 
     Pid.

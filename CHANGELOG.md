@@ -5,6 +5,24 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- A download resumes for as long as connections keep bringing bytes, in place
+  of five retries in all. Each connection is read with a deadline,
+  `resume_after_ms` (10 s): one that goes quiet, fails or closes short is
+  dropped and the rest asked for with `Range`. It gives up after `resumes` (3)
+  connections in a row that brought no new byte, waiting `resume_after_ms`
+  times that count before each. Over a cellular modem every connection carried
+  20-200 KB and then went silent, and the retries ran out on a slow day.
+  `max_retries` and `retry_backoff` are gone, and errors are no longer wrapped
+  in `download_failed`: the reason is what failed (`{connect_failed, _}`,
+  `{http_status, 503}`, `download_stalled`).
+
+### Added
+
+- `{download_resumed, Offset}` to the owner for each resume, which also counts
+  as progress against `download_idle_ms`.
+
 ## [0.2.0] - 2026-09-24
 
 Upgrading changes what a device does by default. **Changed** lists what to

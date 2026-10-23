@@ -253,6 +253,24 @@ an_available_update_is_downloaded_and_failures_reported_test() ->
 
     nh_agent:stop(Agent).
 
+%% A resume is a sign of life: the download reconnected and asked for the
+%% rest. The owner hears where it resumed from.
+a_resumed_download_is_not_given_up_test() ->
+    {Agent, JoinRef} = join(#{updater => nh_ota_resumed, download_idle_ms => 200}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertMatch({update_started, _}, next_event(1000)),
+    ?assertEqual({download_resumed, 4096}, next_event(1000)),
+    ?assertEqual({update_ready, <<"alt.avm">>}, next_event(1000)),
+
+    nh_agent:stop(Agent).
+
 %% `update_available => false' is NervesHub saying there is nothing to do.
 an_unavailable_update_starts_nothing_test() ->
     {Agent, JoinRef} = join(#{}),

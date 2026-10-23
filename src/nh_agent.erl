@@ -605,7 +605,8 @@ update_decision({reschedule, DelayMs, Reason}, State) ->
 
 start_update(Payload, State0) ->
     State = status_update(<<"received">>, #{}, State0),
-    Pid = nh_ota:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
+    Updater = maps:get(updater, maps:get(config, State), nh_ota),
+    Pid = Updater:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
     notify(State, {update_started, Pid}),
     download_alive(State#{update => Pid}).
 
@@ -632,6 +633,10 @@ updater({progress, Percent}, State) ->
             State
         )
     );
+%% The download reconnected and asked for the rest: a sign of life.
+updater({resumed, Offset}, State) ->
+    notify(State, {download_resumed, Offset}),
+    download_alive(State);
 updater({ok, Slot}, State) ->
     %% Written and armed, not yet running. Rebooting is the application's
     %% call: it may have work to finish first, and a library that restarts a

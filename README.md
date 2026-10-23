@@ -137,6 +137,7 @@ The calling process receives `{nerves_hub, Event}`:
 | `{join_error, Reason}` | The server refused the join |
 | `{message, Event, Payload}` | A server message this library does not handle itself |
 | `{update_started, Pid}` | An update is downloading |
+| `{download_resumed, Offset}` | The download reconnected and asked for the rest from `Offset` |
 | `{update_ready, Slot}` | Written and armed; reboot when convenient |
 | `{update_failed, Reason}` | Refused, or the write failed |
 | `{firmware_committed, Slot}` | The running update proved itself |
@@ -222,14 +223,20 @@ running archive is never overwritten, so a refused or corrupt download leaves
 the device running what it had.
 
 NervesHub hears how it goes as it goes: `received` when the update is accepted,
-`started` as each download attempt begins, progress while it downloads,
+`started` as each download connection begins, progress while it downloads,
 `completed` once it is armed, and `failed` with a reason if it is not.
 
-A download that drops part way is resumed from the last byte received, with a
-`Range` request, up to five more times with a growing pause between. Only a
-failure another attempt would not fix, such as a 404 or a flash write that
-failed, ends it at once. A download that goes two minutes without a byte is
-given up on, since the HTTP client has no timeout of its own.
+A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
+short is dropped, and the rest is asked for from the last byte received with a
+`Range` request. The download gives up only after `resumes` (3) connections in
+a row that brought no new byte; one that brought any starts the count again, so
+a slow link that keeps moving takes as many connections as it needs. After one
+that brought nothing it waits `resume_after_ms` times that count. A 5xx counts
+as a connection that brought nothing; a failure another connection would not
+fix, such as a 404 or a flash write that failed, ends it at once. Both
+numbers are options of `nh_ota:apply_update/2`; the agent uses the defaults. A
+download the agent hears nothing from for `download_idle_ms` (two minutes) is
+given up on; a resume counts as hearing from it.
 
 ### Deciding for yourself
 
