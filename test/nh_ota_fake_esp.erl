@@ -21,7 +21,9 @@
 
 start() ->
     stop(),
-    Pid = spawn(fun() -> loop(#{writes => [], erases => [], nvs => #{}, fail => none}) end),
+    Pid = spawn(fun() ->
+        loop(#{writes => [], erases => [], clean => [], nvs => #{}, fail => none})
+    end),
     register(?NAME, Pid),
     ok.
 
@@ -82,12 +84,22 @@ handle({fail, What}, State) ->
     {ok, State#{fail => What}};
 handle({write, _Slot, _Offset, _Data}, #{fail := write} = State) ->
     {error, State#{fail => none}};
-handle({write, Slot, Offset, Data}, #{writes := Writes} = State) ->
-    {ok, State#{writes => Writes ++ [{Slot, Offset, Data}]}};
+%% Like flash: a sector can be written once after it is erased. Writing one
+%% that was not erased since its last write fails, which is how the tests see
+%% that each sector is erased before it is written.
+handle({write, Slot, Offset, Data}, #{writes := Writes, clean := Clean} = State) ->
+    Sectors = sectors(Slot, Offset, byte_size(Data)),
+    case Sectors -- Clean of
+        [] ->
+            {ok, State#{writes => Writes ++ [{Slot, Offset, Data}], clean => Clean -- Sectors}};
+        _Dirty ->
+            {not_erased, State}
+    end;
 handle({erase, _Slot, _Offset, _Size}, #{fail := erase} = State) ->
     {error, State#{fail => none}};
-handle({erase, Slot, Offset, Size}, #{erases := Erases} = State) ->
-    {ok, State#{erases => Erases ++ [{Slot, Offset, Size}]}};
+handle({erase, Slot, Offset, Size}, #{erases := Erases, clean := Clean} = State) ->
+    Sectors = sectors(Slot, Offset, Size),
+    {ok, State#{erases => Erases ++ [{Slot, Offset, Size}], clean => (Clean -- Sectors) ++ Sectors}};
 handle({nvs_set, _Ns, _Key, _Value}, #{fail := nvs_set} = State) ->
     {error, State#{fail => none}};
 handle({nvs_set, Ns, Key, Value}, #{nvs := Nvs} = State) ->
@@ -104,6 +116,9 @@ handle(erased, #{erases := Erases} = State) ->
     {Erases, State};
 handle(nvs, #{nvs := Nvs} = State) ->
     {Nvs, State}.
+
+sectors(Slot, Offset, Size) ->
+    [{Slot, S} || S <- lists:seq(Offset div 4096, (Offset + Size - 1) div 4096)].
 
 image(Writes) ->
     lists:foldl(

@@ -5,6 +5,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Each flash sector is erased just before it is written, in place of the
+  whole archive before the download. An erase holds the CPU, and AtomVM's
+  scheduler with it: a ~460 KB archive erased up front stopped every process
+  for seconds, long enough for a call elsewhere in the application to time out.
+
 ### Added
 
 - `network_interface` may be a function, asked on each join and download,

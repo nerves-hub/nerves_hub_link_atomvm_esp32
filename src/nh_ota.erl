@@ -154,7 +154,7 @@ download_into(Slot, Payload, Opts) ->
 
     case parse_url(Url) of
         {ok, Parsed} ->
-            case erase(Slot, Size, Opts) of
+            case check_size(Size) of
                 ok -> fetch(Slot, Parsed, Size, Checksum, Progress, Opts);
                 {error, _} = Error -> Error
             end;
@@ -162,22 +162,34 @@ download_into(Slot, Payload, Opts) ->
             Error
     end.
 
-%% Only what the archive needs, rounded up to a sector. Whatever is left of the
-%% old archive beyond it is unreachable: a packbeam ends at its terminator and
+check_size(undefined) -> {error, {missing_update_field, size}};
+check_size(Size) when is_integer(Size), Size > 0 -> ok;
+check_size(Size) -> {error, {invalid_update_size, Size}}.
+
+%% Each sector is erased just before its block is written, not the whole
+%% archive up front. An erase holds the CPU, and AtomVM's scheduler with it:
+%% the ~460 KB of an archive erased at once stopped every process for
+%% seconds, long enough for a call elsewhere in the application to time out.
+%% A sector at a time spreads that over the download, a few
+%% tens of milliseconds per block. Whatever is left of the old archive beyond
+%% the new one is unreachable: a packbeam ends at its terminator and
 %% `nh_packbeam:byte_length/1' stops there.
-erase(_Slot, undefined, _Opts) ->
-    {error, {missing_update_field, size}};
-erase(Slot, Size, Opts) when is_integer(Size), Size > 0 ->
-    Sectors = ((Size + ?BLOCK_SIZE - 1) div ?BLOCK_SIZE) * ?BLOCK_SIZE,
-    try apply(esp(Opts), partition_erase_range, [Slot, 0, Sectors]) of
+erase_sector(Slot, Offset, Opts) ->
+    try apply(esp(Opts), partition_erase_range, [Slot, Offset, ?BLOCK_SIZE]) of
         ok -> ok;
-        error -> {error, {erase_failed, Slot, Sectors}};
+        error -> {error, {erase_failed, Slot, Offset}};
         Other -> {error, {unexpected_erase, Other}}
     catch
         _:Reason -> {error, {erase_failed, Reason}}
-    end;
-erase(_Slot, Size, _Opts) ->
-    {error, {invalid_update_size, Size}}.
+    end.
+
+%% Erase, then write: flash can only be written once between erases. Blocks
+%% start on a sector boundary, and the tail is shorter than a sector.
+write_sector(Slot, Offset, Data, Opts) ->
+    case erase_sector(Slot, Offset, Opts) of
+        ok -> partition_write(Slot, Offset, Data, Opts);
+        {error, _} = Error -> Error
+    end.
 
 fetch(Slot, Parsed, Size, Checksum, Progress, Opts) ->
     State = #{
@@ -314,9 +326,9 @@ handle([{done, _Ref} | _Rest], State) ->
 
 %% 206 is the rest of the archive from where the last attempt stopped. 200 is
 %% all of it: a server that ignores `Range' is allowed to, and the only thing
-%% to do is start again — erasing first, since flash can only be written once
-%% between erases. A 5xx may pass; anything else in the 4xx range will not,
-%% and asking again only delays saying so.
+%% to do is start again; each sector is erased again as it is rewritten. A 5xx
+%% may pass; anything else in the 4xx range will not, and asking again only
+%% delays saying so.
 status(206, State) ->
     {ok, State#{status => 206}};
 status(200, State) ->
@@ -329,19 +341,14 @@ status(Status, State) when Status >= 500 ->
 status(Status, _State) ->
     {error, {http_status, Status}}.
 
-restart(#{slot := Slot, size := Size, opts := Opts} = State) ->
-    case erase(Slot, Size, Opts) of
-        ok ->
-            {ok, State#{
-                status => 200,
-                offset => 0,
-                written => 0,
-                buffer => <<>>,
-                hash => crypto:hash_init(sha256)
-            }};
-        {error, _} = Error ->
-            Error
-    end.
+restart(State) ->
+    {ok, State#{
+        status => 200,
+        offset => 0,
+        written => 0,
+        buffer => <<>>,
+        hash => crypto:hash_init(sha256)
+    }}.
 
 %% Buffer to a block, write whole blocks, keep the remainder. The hash covers
 %% the bytes as they arrive, so it catches corruption in flight rather than
@@ -358,7 +365,7 @@ emit_blocks(Buffer, State) when byte_size(Buffer) < ?BLOCK_SIZE ->
     {ok, State#{buffer => Buffer}};
 emit_blocks(Buffer, #{slot := Slot, offset := Offset, opts := Opts} = State) ->
     <<Block:?BLOCK_SIZE/binary, Rest/binary>> = Buffer,
-    case partition_write(Slot, Offset, Block, Opts) of
+    case write_sector(Slot, Offset, Block, Opts) of
         ok ->
             emit_blocks(Rest, State#{
                 offset => Offset + ?BLOCK_SIZE,
@@ -375,7 +382,7 @@ flush(#{buffer := Buffer, slot := Slot, offset := Offset, opts := Opts} = State)
     byte_size(Buffer) > 0
 ->
     Padded = pad4(Buffer),
-    case partition_write(Slot, Offset, Padded, Opts) of
+    case write_sector(Slot, Offset, Padded, Opts) of
         ok ->
             {ok, State#{
                 buffer => <<>>,
