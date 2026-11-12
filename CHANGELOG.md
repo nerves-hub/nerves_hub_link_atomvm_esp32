@@ -7,6 +7,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Each flash sector is erased just before it is written, in place of the
+  whole archive before the download. An erase holds the CPU, and AtomVM's
+  scheduler with it: a ~460 KB archive erased up front stopped every process
+  for seconds, long enough for a call elsewhere in the application to time out.
 - An armed update counts as busy until the reboot: offered again before then,
   it is not downloaded into the other slot, which by then holds the previous
   firmware.
