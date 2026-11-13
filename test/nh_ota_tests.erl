@@ -191,6 +191,42 @@ a_failed_write_stops_the_install_test() ->
     %% And nothing was armed, so the device still boots what it had.
     ?assertEqual(undefined, maps:get({atomvm, boot_path}, Nvs, undefined)).
 
+%% An archive bigger than the slot it would overwrite is refused before
+%% anything is erased: a device whose partition table is older than the
+%% application keeps what it boots, untouched.
+an_archive_bigger_than_the_slot_is_refused_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body()),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+    Small = byte_size(body()) - 1,
+    ok = nh_ota_fake_esp:partitions([{?SLOT, 1, 64, 16#290000, Small, []}]),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{})),
+    Erased = nh_ota_fake_esp:erased(),
+
+    cleanup(ok),
+    ?assertEqual({error, {update_too_big, byte_size(body()), Small}}, Result),
+    ?assertEqual([], Erased).
+
+%% A slot just as big as the archive takes it; a list that does not name the
+%% slot has nothing to check against.
+an_archive_that_fits_the_slot_goes_in_test_() ->
+    [
+        ?_test(fits([{?SLOT, 1, 64, 16#290000, byte_size(body()), []}])),
+        ?_test(fits([{<<"other">>, 1, 64, 16#10000, 1, []}]))
+    ].
+
+fits(Partitions) ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body()),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+    ok = nh_ota_fake_esp:partitions(Partitions),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{})),
+
+    cleanup(ok),
+    ?assertEqual({ok, ?SLOT}, Result).
+
 a_refused_connection_is_an_error_not_a_crash_test() ->
     ok = nh_ota_fake_esp:start(),
     ok = nh_ota_fake_http:fail_connect(),

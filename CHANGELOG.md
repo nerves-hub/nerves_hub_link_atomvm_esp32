@@ -7,6 +7,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- An update bigger than the slot it would overwrite is refused before
+  anything is erased, as `{error, {update_too_big, Size, SlotSize}}`, instead
+  of failing halfway through the download with the slot already half
+  rewritten.
 - Each flash sector is erased just before it is written, in place of the
   whole archive before the download. An erase holds the CPU, and AtomVM's
   scheduler with it: a ~460 KB archive erased up front stopped every process
