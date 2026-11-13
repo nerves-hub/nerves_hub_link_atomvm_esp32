@@ -149,8 +149,13 @@ download_into(Slot, Payload, Opts) ->
     case parse_url(Url) of
         {ok, Parsed} ->
             case check_size(Size) of
-                ok -> fetch(Slot, Parsed, Size, Checksum, Progress, Opts);
-                {error, _} = Error -> Error
+                ok ->
+                    case check_fits(Slot, Size, Opts) of
+                        ok -> fetch(Slot, Parsed, Size, Checksum, Progress, Opts);
+                        {error, _} = Error -> Error
+                    end;
+                {error, _} = Error ->
+                    Error
             end;
         {error, _} = Error ->
             Error
@@ -159,6 +164,34 @@ download_into(Slot, Payload, Opts) ->
 check_size(undefined) -> {error, {missing_update_field, size}};
 check_size(Size) when is_integer(Size), Size > 0 -> ok;
 check_size(Size) -> {error, {invalid_update_size, Size}}.
+
+%% The archive must fit the slot it is about to overwrite. A device whose
+%% partition table has slots smaller than the archive (a table older than the
+%% application) would otherwise find out halfway through the download, with
+%% the slot already half rewritten, and NervesHub would count a failed update.
+%% Refused here, nothing is erased. Without a partition list to check against
+%% (a platform without `esp:partition_list/0', or a slot it does not name), the
+%% download goes ahead as before.
+check_fits(Slot, Size, Opts) ->
+    case slot_size(Slot, Opts) of
+        {ok, SlotSize} when Size > SlotSize -> {error, {update_too_big, Size, SlotSize}};
+        _ -> ok
+    end.
+
+slot_size(Slot, Opts) ->
+    try apply(esp(Opts), partition_list, []) of
+        Partitions when is_list(Partitions) ->
+            case
+                [S || {Label, _Type, _Subtype, _Address, S, _Props} <- Partitions, Label =:= Slot]
+            of
+                [SlotSize] -> {ok, SlotSize};
+                _ -> unknown
+            end;
+        _ ->
+            unknown
+    catch
+        _:_ -> unknown
+    end.
 
 %% Each sector is erased just before its block is written, not the whole
 %% archive up front. An erase holds the CPU, and AtomVM's scheduler with it:
