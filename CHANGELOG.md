@@ -5,6 +5,18 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- A batch of log lines is encoded a line at a time. Encoded whole, a 2 KB
+  batch took 9 KB off the lowest free heap of an ESP32 without PSRAM, at the
+  flush that follows the extensions attaching; a line at a time, nothing
+  measurable.
+- A batch of log lines also stops at 4096 bytes of messages, not only at 100
+  lines; the rest goes at the next flush. A batch is encoded in one go right
+  after a rejoin, when the TLS handshake has just taken its share of the heap,
+  and a hundred lines of a few hundred bytes each ran an ESP32 without PSRAM
+  out of memory there. The first line always goes, however long.
+
 ## [0.2.0] - 2026-09-24
 
 Upgrading changes what a device does by default. **Changed** lists what to
