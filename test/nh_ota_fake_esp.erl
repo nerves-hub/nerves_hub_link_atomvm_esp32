@@ -13,15 +13,19 @@
 %% install path that matters and the half a real device will not do on demand.
 -module(nh_ota_fake_esp).
 
--export([start/0, stop/0, written/0, erased/0, nvs/0, fail/1]).
--export([partition_write/3, partition_erase_range/3]).
+-export([start/0, stop/0, written/0, erased/0, nvs/0, fail/1, partitions/1]).
+-export([partition_write/3, partition_erase_range/3, partition_list/0]).
 -export([nvs_set_binary/3, nvs_get_binary/2, nvs_erase_key/2]).
 
 -define(NAME, ?MODULE).
 
 start() ->
     stop(),
-    Pid = spawn(fun() -> loop(#{writes => [], erases => [], nvs => #{}, fail => none}) end),
+    Pid = spawn(fun() ->
+        loop(#{
+            writes => [], erases => [], clean => [], nvs => #{}, fail => none, partitions => none
+        })
+    end),
     register(?NAME, Pid),
     ok.
 
@@ -47,11 +51,21 @@ nvs() -> call(nvs).
 %% `fail(write)' makes the next partition_write return `error'.
 fail(What) -> call({fail, What}).
 
+%% What `partition_list/0' answers: a list of partitions, or `none' to make it
+%% raise, as on a platform without the call.
+partitions(Partitions) -> call({partitions, Partitions}).
+
 %% ------------------------------------------------------- the `esp' interface
 
 partition_write(Slot, Offset, Data) -> call({write, Slot, Offset, Data}).
 
 partition_erase_range(Slot, Offset, Size) -> call({erase, Slot, Offset, Size}).
+
+partition_list() ->
+    case call(partitions) of
+        none -> erlang:error(undef);
+        Partitions -> Partitions
+    end.
 
 nvs_set_binary(Namespace, Key, Value) -> call({nvs_set, Namespace, Key, Value}).
 
@@ -80,14 +94,28 @@ loop(State) ->
 
 handle({fail, What}, State) ->
     {ok, State#{fail => What}};
+handle({partitions, Partitions}, State) ->
+    {ok, State#{partitions => Partitions}};
+handle(partitions, #{partitions := Partitions} = State) ->
+    {Partitions, State};
 handle({write, _Slot, _Offset, _Data}, #{fail := write} = State) ->
     {error, State#{fail => none}};
-handle({write, Slot, Offset, Data}, #{writes := Writes} = State) ->
-    {ok, State#{writes => Writes ++ [{Slot, Offset, Data}]}};
+%% Like flash: a sector can be written once after it is erased. Writing one
+%% that was not erased since its last write fails, which is how the tests see
+%% that each sector is erased before it is written.
+handle({write, Slot, Offset, Data}, #{writes := Writes, clean := Clean} = State) ->
+    Sectors = sectors(Slot, Offset, byte_size(Data)),
+    case Sectors -- Clean of
+        [] ->
+            {ok, State#{writes => Writes ++ [{Slot, Offset, Data}], clean => Clean -- Sectors}};
+        _Dirty ->
+            {not_erased, State}
+    end;
 handle({erase, _Slot, _Offset, _Size}, #{fail := erase} = State) ->
     {error, State#{fail => none}};
-handle({erase, Slot, Offset, Size}, #{erases := Erases} = State) ->
-    {ok, State#{erases => Erases ++ [{Slot, Offset, Size}]}};
+handle({erase, Slot, Offset, Size}, #{erases := Erases, clean := Clean} = State) ->
+    Sectors = sectors(Slot, Offset, Size),
+    {ok, State#{erases => Erases ++ [{Slot, Offset, Size}], clean => (Clean -- Sectors) ++ Sectors}};
 handle({nvs_set, _Ns, _Key, _Value}, #{fail := nvs_set} = State) ->
     {error, State#{fail => none}};
 handle({nvs_set, Ns, Key, Value}, #{nvs := Nvs} = State) ->
@@ -104,6 +132,9 @@ handle(erased, #{erases := Erases} = State) ->
     {Erases, State};
 handle(nvs, #{nvs := Nvs} = State) ->
     {Nvs, State}.
+
+sectors(Slot, Offset, Size) ->
+    [{Slot, S} || S <- lists:seq(Offset div 4096, (Offset + Size - 1) div 4096)].
 
 image(Writes) ->
     lists:foldl(

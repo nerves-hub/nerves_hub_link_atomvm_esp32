@@ -137,6 +137,8 @@ The calling process receives `{nerves_hub, Event}`:
 | `{join_error, Reason}` | The server refused the join |
 | `{message, Event, Payload}` | A server message this library does not handle itself |
 | `{update_started, Pid}` | An update is downloading |
+| `{download_socket, open \| closed, Largest}` | With `keep_open_above`: whether the socket stays open for the download |
+| `{download_resumed, Offset}` | The download reconnected and asked for the rest from `Offset` |
 | `{update_ready, Slot}` | Written and armed; reboot when convenient |
 | `{update_failed, Reason}` | Refused, or the write failed |
 | `{firmware_committed, Slot}` | The running update proved itself |
@@ -208,6 +210,8 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `network_interface` | `<<"wlan0">>` | What the device reports it connects over |
 | `log_flush_ms` | 10000 | How long batched log lines wait |
 | `log_buffer` | 100 | Log lines held before the oldest are dropped |
+| `keep_open_above` | unset: open | Close the socket while an update downloads unless this many bytes are free in one block, or `never` to always close. See [updates](#updates) |
+| `before_update` | none | A function run before a download starts, to free memory |
 | `transport` | `websocket_client` | |
 
 ## Updates
@@ -222,14 +226,30 @@ running archive is never overwritten, so a refused or corrupt download leaves
 the device running what it had.
 
 NervesHub hears how it goes as it goes: `received` when the update is accepted,
-`started` as each download attempt begins, progress while it downloads,
+`started` as each download connection begins, progress while it downloads,
 `completed` once it is armed, and `failed` with a reason if it is not.
 
-A download that drops part way is resumed from the last byte received, with a
-`Range` request, up to five more times with a growing pause between. Only a
-failure another attempt would not fix, such as a 404 or a flash write that
-failed, ends it at once. A download that goes two minutes without a byte is
-given up on, since the HTTP client has no timeout of its own.
+An ESP32 without PSRAM may have room for one TLS session, not two: with the
+socket open, the download's handshake can leave too little heap for the next
+record on either connection, and the device aborts. `keep_open_above => Bytes`
+closes the socket while an update downloads, unless the largest free block of
+heap is at least `Bytes` as the download starts, and reopens it afterwards;
+`never` always closes it. The owner hears `{download_socket, open | closed,
+LargestFreeBlock}`, and what NervesHub would have heard while the socket was
+closed is sent, in order, once the device has joined again. `before_update`
+runs before any of this, so the application can free memory of its own first.
+
+A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
+short is dropped, and the rest is asked for from the last byte received with a
+`Range` request. The download gives up only after `resumes` (3) connections in
+a row that brought no new byte; one that brought any starts the count again, so
+a slow link that keeps moving takes as many connections as it needs. After one
+that brought nothing it waits `resume_after_ms` times that count. A 5xx counts
+as a connection that brought nothing; a failure another connection would not
+fix, such as a 404 or a flash write that failed, ends it at once. Both
+numbers are options of `nh_ota:apply_update/2`; the agent uses the defaults. A
+download the agent hears nothing from for `download_idle_ms` (two minutes) is
+given up on; a resume counts as hearing from it.
 
 ### Deciding for yourself
 
