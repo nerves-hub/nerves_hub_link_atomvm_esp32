@@ -76,6 +76,8 @@
 %%
 %% Either `shared_secret => {Key, Secret}' or `client_cert => {CertPem, KeyPem}'.
 %% Which one to use is an organization's choice, and NervesHub accepts both.
+%% Either pair may also be given as a fun that returns it, and the agent keeps
+%% it as one, so that a crash report never prints the key (see `nh_agent').
 %%
 %% A shared-secret signature is time-bound: NervesHub refuses one signed more
 %% than 90 seconds ago. An ESP32 boots at the epoch, so the clock has to be set
@@ -227,8 +229,8 @@
     host => binary() | string(),
     identifier := binary(),
     firmware => firmware_source(),
-    shared_secret => {binary(), binary()},
-    client_cert => {binary(), binary()},
+    shared_secret => nh_agent:credentials(),
+    client_cert => nh_agent:credentials(),
     verify => crt_bundle | {cacert_pem, binary()} | none,
     console => boolean(),
     extensions => all | [health | geo | logging],

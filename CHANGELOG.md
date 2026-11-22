@@ -40,6 +40,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSON-encoded in the agent, which on AtomVM costs the process many times the
   output's size in heap: a 2 KB answer with quotes in it took more than an
   ESP32 without PSRAM had in one block, and the device panicked.
+- `client_cert` and `shared_secret` are kept sealed in a fun in the agent's
+  state and opened only to build the socket's options. A crash prints the
+  process's state, and with it the device's private key, to the serial log and
+  the crash report; a fun prints as `#Fun<..>`. Either may also be given as
+  such a fun.
 
 ## [0.2.0] - 2026-09-24
 
