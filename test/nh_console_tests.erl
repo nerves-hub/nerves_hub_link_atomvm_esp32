@@ -130,3 +130,20 @@ parse_splits_a_command_from_its_arguments_test() ->
     ?assertEqual({<<"a">>, [<<"b">>]}, nh_console:parse(<<"   a    b   ">>)),
     ?assertEqual(empty, nh_console:parse(<<"">>)),
     ?assertEqual(empty, nh_console:parse(<<"   \r\n">>)).
+
+%% Output goes up in pieces, and a piece never ends inside a character.
+chunks_test() ->
+    ?assertEqual([<<"abc">>], nh_console:chunks(<<"abc">>, 4)),
+    ?assertEqual([<<"abcd">>, <<"ef">>], nh_console:chunks(<<"abcdef">>, 4)),
+    %% "é" is two bytes: the cut moves back rather than split it
+    ?assertEqual([<<"abc">>, <<"é"/utf8, "d">>], nh_console:chunks(<<"abcéd"/utf8>>, 4)),
+    Long = binary:copy(<<"ação "/utf8>>, 100),
+    Chunks = nh_console:chunks(Long, 256),
+    ?assertEqual(Long, iolist_to_binary(Chunks)),
+    lists:foreach(
+        fun(Chunk) ->
+            ?assert(byte_size(Chunk) =< 256),
+            ?assertMatch(<<_/binary>>, unicode:characters_to_binary(Chunk))
+        end,
+        Chunks
+    ).

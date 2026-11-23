@@ -36,6 +36,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nerves-hub/atomvm_websocket_client#3, answered a bare `not_connected` when
   the socket closed under a queued send. Any refusal is now
   `{send_failed, Reason}`.
+- Console output goes up in pieces of at most 256 bytes. Each `up` is
+  JSON-encoded in the agent, which on AtomVM costs the process many times the
+  output's size in heap: a 2 KB answer with quotes in it took more than an
+  ESP32 without PSRAM had in one block, and the device panicked.
 
 ## [0.2.0] - 2026-09-24
 
