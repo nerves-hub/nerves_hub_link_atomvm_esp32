@@ -92,6 +92,17 @@
 %% has no shell, so this answers it with a debug terminal instead — a fixed set
 %% of commands, listed by `help'. See `nh_console'.
 %%
+%% `console_commands' adds the application's own, as `{Name, Description,
+%% Fun}', or `{Section, Name, Description, Fun}' to list it under a section of
+%% `help': `Fun' gets the line's arguments and returns the output. The names,
+%% sections and descriptions are binaries, and `help' is taken; anything else
+%% is refused at start as `{invalid_console_command, Entry}'.
+%%
+%% `Fun' runs in the agent's process. While it runs the agent sends no
+%% heartbeat and reads no frame, so it must be quick; and it must not call
+%% `nerves_hub_link', whose calls go to the agent and would wait on themselves
+%% until they time out.
+%%
 %% It reports, and it reboots. It will not evaluate Erlang, and it is not a way
 %% in to a running system.
 %%
@@ -236,6 +247,7 @@
     client_cert => nh_agent:credentials(),
     verify => crt_bundle | {cacert_pem, binary()} | none,
     console => boolean(),
+    console_commands => [nh_console:command()],
     extensions => all | [health | geo | logging],
     reboot => auto | manual,
     updates => auto | manual,
@@ -523,12 +535,34 @@ validate(Config) ->
     case missing_keys(Config) of
         [] ->
             case usable_clock(Config) of
-                ok -> resolve_url(Config);
+                ok -> console_commands(Config);
                 {error, _} = Error -> Error
             end;
         Missing ->
             {error, {missing_config, Missing}}
     end.
+
+%% Checked here so a wrong entry is an error from `start_link', not a crash of
+%% the agent after it returned `{ok, Pid}', or the first time someone types
+%% `help'. `help' is the console's own and cannot be replaced.
+console_commands(Config) ->
+    case maps:get(console_commands, Config, []) of
+        Commands when is_list(Commands) ->
+            case [C || C <- Commands, not console_command(C)] of
+                [] -> resolve_url(Config);
+                [Bad | _] -> {error, {invalid_console_command, Bad}}
+            end;
+        Other ->
+            {error, {invalid_console_command, Other}}
+    end.
+
+console_command({Name, Description, Fun}) ->
+    console_command({<<"application">>, Name, Description, Fun});
+console_command({Section, Name, Description, Fun}) ->
+    is_binary(Section) andalso is_binary(Name) andalso Name =/= <<>> andalso
+        Name =/= <<"help">> andalso is_binary(Description) andalso is_function(Fun, 1);
+console_command(_Other) ->
+    false.
 
 %% Resolved here so that a config naming a host it cannot build a URL from
 %% fails at startup rather than inside the transport.

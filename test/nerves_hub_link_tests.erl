@@ -71,6 +71,31 @@ a_config_that_cannot_build_a_url_is_refused_test() ->
         nerves_hub_link:start(config(#{host => <<"nh.example.com">>}))
     ).
 
+%% A wrong console command is an error from start, not a crash of the agent
+%% afterwards, or the first time someone types `help'.
+a_wrong_console_command_is_refused_at_start_test() ->
+    Fun = fun(_) -> <<>> end,
+    Wrong = [
+        {<<"a">>, Fun},
+        #{name => <<"a">>},
+        {"a", <<"charlist name">>, Fun},
+        {<<"a">>, "charlist description", Fun},
+        {section, <<"a">>, <<"atom section">>, Fun},
+        {<<"a">>, <<"no arguments">>, fun() -> <<>> end},
+        {<<"help">>, <<"taken">>, Fun}
+    ],
+    [
+        ?assertEqual(
+            {error, {invalid_console_command, Entry}},
+            nerves_hub_link:start(config(#{firmware => none, console_commands => [Entry]}))
+        )
+     || Entry <- Wrong
+    ],
+    ?assertEqual(
+        {error, {invalid_console_command, nope}},
+        nerves_hub_link:start(config(#{firmware => none, console_commands => nope}))
+    ).
+
 %% What an Elixir caller writes. The library is meant to be usable from Elixir
 %% without a wrapper in between, and a map with atom keys is not what anyone
 %% reaches for there first.

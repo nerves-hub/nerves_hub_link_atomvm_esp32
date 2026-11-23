@@ -198,6 +198,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `updates` | `auto` | `manual` reports the offer and does nothing |
 | `reboot` | `auto` | `manual` reports `reboot_requested` instead |
 | `console` | `false` | Join NervesHub's console channel |
+| `console_commands` | `[]` | The application's own console commands. See [the console](#the-console) |
 | `extensions` | none | `all`, or any of `health`, `geo`, `logging` |
 | `capture_io` | `false` | Send what the application prints |
 | `register` | none | Register the agent under a name |
@@ -331,7 +332,33 @@ which is off by default. Without it a device configured with keys reports
 `console => true` joins NervesHub's console channel. On Nerves, `nerves_hub_link`
 answers that channel with an IEx session. AtomVM has no shell, so this answers
 with a fixed set of commands instead: `help`, `info`, `firmware`, `memory`,
-`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`.
+`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`, `clear`. The up
+and down arrows walk through the last lines entered.
+
+`console_commands` adds the application's own:
+
+```erlang
+console_commands => [
+    {<<"relays">>, <<"the relay states">>, fun(_Args) -> my_app:relays() end},
+    {<<"io">>, <<"di">>, <<"the digital inputs">>, fun(Args) -> my_app:inputs(Args) end}
+]
+```
+
+`Fun` gets the line's arguments and returns the output (iodata); a line end is
+added if it has none. One that raises prints the error instead of taking the
+console down. `help` lists the commands by section: the built-in ones are in
+`device` and `network`, an application's goes in the section it names or in
+`application`. One with a built-in's name replaces it; `help` itself cannot be
+replaced. Names, sections and descriptions are binaries, and an entry that is
+not is refused at start with `{error, {invalid_console_command, Entry}}`.
+Support scripts run the built-in commands only, and `clear` prints nothing
+there.
+
+`Fun` runs in the agent's process. While it runs, the agent sends no heartbeat
+and reads no frame, so it must be quick. It must not call `nerves_hub_link`:
+those calls go to the agent and would wait on themselves until they time out.
+
+A line is at most 256 bytes; what is typed past that is not kept.
 
 It reports, and it reboots. It will not evaluate Erlang, and it is not a way in
 to a running system.
