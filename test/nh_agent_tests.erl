@@ -199,6 +199,18 @@ surfaces_join_and_messages_test() ->
 
     nh_agent:stop(Agent).
 
+%% Pings are the transport's business; the agent only passes the interval on,
+%% once a minute unless told otherwise rather than the IDF's every 10 s.
+passes_the_ping_interval_to_the_transport_test() ->
+    setup(),
+    {ok, Default} = nh_agent:start(config(#{})),
+    ?assertEqual(60000, maps:get(ping_interval_ms, next_opened())),
+    nh_agent:stop(Default),
+
+    {ok, Agent} = nh_agent:start(config(#{ping_interval_ms => 15000})),
+    ?assertEqual(15000, maps:get(ping_interval_ms, next_opened())),
+    nh_agent:stop(Agent).
+
 %% ------------------------------------------------------------------- helpers
 
 next_opened() ->

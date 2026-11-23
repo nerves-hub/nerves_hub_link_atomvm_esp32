@@ -5,6 +5,19 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,
+  passed to the transport.
+
+### Changed
+
+- The socket pings once a minute by default, not every 10 seconds as
+  ESP-IDF does on its own. On a metered link (a cellular modem, say) the pings
+  cost more than the heartbeats, and NervesHub needs only the
+  heartbeats to keep the socket. A dead link is now noticed within 3 minutes
+  rather than 2:10; set `ping_interval_ms` lower to get that back.
+
 ### Fixed
 
 - A send the transport refused with anything but `{error, _}` crashed the
