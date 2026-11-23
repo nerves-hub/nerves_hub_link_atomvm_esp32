@@ -451,6 +451,27 @@ a_failure_with_the_socket_closed_waits_before_opening_test() ->
 
     nh_agent:stop(Agent).
 
+%% A new update offered while an earlier failure waits to join again starts
+%% that wait over: the join it was waiting for would close the socket in the
+%% middle of the new download, and connect beside it.
+a_new_update_cancels_the_wait_to_join_again_test() ->
+    {Agent, JoinRef} = join(#{
+        updater => nh_ota_bad_then_slow, update_retry_backoff => {300, 300}
+    }),
+    send_update(Agent, JoinRef, (update())#{
+        <<"firmware_url">> => <<"http://example.com/bad.avm">>
+    }),
+    wait_for_notice({update_failed, '_'}, 1000),
+
+    send_update(Agent, JoinRef, update()),
+    wait_for_notice({update_started, '_'}, 1000),
+    receive
+        closed -> erlang:error(closed_during_the_download)
+    after 800 -> ok
+    end,
+
+    nh_agent:stop(Agent).
+
 %% Each failure in a row waits longer before the next join.
 failures_in_a_row_wait_longer_test() ->
     {Agent, JoinRef} = join(#{
@@ -655,6 +676,34 @@ statuses_made_while_closed_go_after_the_next_join_test() ->
 
     nh_agent:stop(Agent).
 
+%% Armed is not running. The join after the socket opens again finds the new
+%% slot pending, but the device has not booted it: committing then would drop
+%% the slot a failed boot goes back to, and tell NervesHub the old firmware
+%% validated the new.
+an_armed_update_is_not_committed_on_the_next_join_test() ->
+    ok = nh_ota_fake_esp:start(),
+    {Agent, JoinRef} = join(#{
+        esp => nh_ota_fake_esp, keep_open_above => never, updater => nh_ota_armed
+    }),
+
+    send_update(Agent, JoinRef, update()),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, wait_for_event(<<"status_update">>, 1000))),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    wait_for_notice({joined, '_'}, 1000),
+    ?assertNot(lists:member({firmware_committed, <<"alt.avm">>}, events())),
+
+    Nvs = nh_ota_fake_esp:nvs(),
+    ?assertEqual(<<"alt.avm">>, maps:get({nerves_hub, pending_slot}, Nvs)),
+    ?assertEqual(<<"main.avm">>, maps:get({nerves_hub, previous_slot}, Nvs)),
+
+    nh_agent:stop(Agent),
+    nh_ota_fake_esp:stop().
+
 %% Lost, not closed for the download, a connection keeps its backoff: the
 %% download ending does not open it early.
 a_connection_lost_during_the_download_keeps_its_backoff_test() ->
@@ -723,6 +772,13 @@ flush_events() ->
     case next_event(100) of
         no_event -> ok;
         _ -> flush_events()
+    end.
+
+%% What the owner hears until it hears nothing for a moment.
+events() ->
+    case next_event(300) of
+        no_event -> [];
+        Event -> [Event | events()]
     end.
 
 %% `update_available => false' is NervesHub saying there is nothing to do.

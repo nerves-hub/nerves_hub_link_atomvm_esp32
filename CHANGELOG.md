@@ -132,6 +132,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process's state, and with it the device's private key, to the serial log and
   the crash report; a fun prints as `#Fun<..>`. Either may also be given as
   such a fun.
+- An update written and armed for the next boot was committed by any join
+  before the reboot, while the device still ran the firmware it had: the slot
+  a failed boot goes back to was dropped, and NervesHub heard the old firmware
+  validate the new. Only a reconnect between the two did it before; with the
+  socket closed for the download, reopening it after every update did.
 
 ## [0.2.0] - 2026-09-24
 

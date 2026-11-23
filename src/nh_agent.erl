@@ -675,6 +675,14 @@ after_revert(State) ->
 %% Joining is the evidence this library accepts: firmware that cannot reach
 %% NervesHub is firmware nothing could recover from remotely, so it is exactly
 %% what must not be committed.
+%%
+%% Except for an update this agent armed itself: it is written and the boot
+%% path points at it, but the device still runs the firmware it had. A join
+%% before the reboot -- the socket opening again after a download, or any
+%% reconnect -- proves nothing about it, and committing would drop the slot a
+%% failed boot goes back to.
+validate_pending(#{armed := _Slot} = State) ->
+    State;
 validate_pending(State0) ->
     State = cancel_timer(trial_deadline, State0),
     case nh_ota:pending(ota_opts(State)) of
@@ -746,8 +754,13 @@ update_decision({ignore, Reason}, State) ->
 update_decision({reschedule, DelayMs, Reason}, State) ->
     status_update(<<"rescheduled">>, #{<<"delay_for">> => DelayMs, <<"reason">> => Reason}, State).
 
+%% A join or reopen still waiting out the backoff of an earlier failure is
+%% for that failure: firing in the middle of this download, it would close a
+%% socket kept open and connect again, a second TLS handshake beside the
+%% download's. Should this one fail, it sets its own.
 start_update(Payload, State0) ->
-    State = status_update(<<"received">>, #{}, State0),
+    State1 = cancel_timer(rejoin, cancel_timer(reopen, State0)),
+    State = status_update(<<"received">>, #{}, State1),
     case before_update(State) of
         ok -> download(Payload, State);
         {error, Reason} -> update_failed(Reason, <<"before_update_failed">>, State)
