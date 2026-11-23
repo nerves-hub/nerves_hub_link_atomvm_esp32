@@ -455,9 +455,89 @@ an_armed_update_is_not_downloaded_again_test() ->
         <<"checksum">> => <<"abc">>
     }),
     ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    %% The owner hears why: the reboot it put off is what stands in the way.
+    ?assertEqual({update_ignored, armed}, next_event(1000)),
     ?assertEqual(no_event, next_event(300)),
 
     nh_agent:stop(Agent).
+
+%% Applied by hand, an update while another is armed is refused the same way,
+%% and so is asking for one.
+an_armed_update_refuses_a_manual_apply_and_a_request_test() ->
+    Update = #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    },
+    {Agent, JoinRef} = join(#{updater => nh_ota_resumed, updates => manual}),
+    send_update(Agent, JoinRef, Update),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ok = nerves_hub_link:apply_update(Agent, Update),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    flush_events(),
+
+    ok = nerves_hub_link:apply_update(Agent, Update),
+    ?assertEqual({update_decision_ignored, armed}, next_event(1000)),
+    ?assertEqual({error, armed}, nerves_hub_link:request_update(Agent)),
+
+    nh_agent:stop(Agent).
+
+%% A `before_update' that does not return `ok' is an update that does not
+%% happen: the owner and NervesHub hear it failed, and the agent carries on.
+a_failing_before_update_fails_the_update_test() ->
+    {Agent, JoinRef} = join(#{before_update => fun() -> {error, busy} end}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertEqual({update_failed, {before_update, {error, busy}}}, next_event(1000)),
+    _Received = wait_for_event(<<"status_update">>, 1000),
+    Failed = wait_for_event(<<"status_update">>, 1000),
+    ?assertEqual(<<"before_update_failed">>, maps:get(<<"reason">>, Failed)),
+    ?assert(is_process_alive(Agent)),
+
+    nh_agent:stop(Agent).
+
+%% A download that starts again each resume does not queue a `started' each
+%% time: NervesHub hears the latest of each status.
+a_status_held_while_closed_is_kept_once_test() ->
+    {Agent, JoinRef} = join(#{keep_open_above => never, updater => nh_ota_restarted}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, wait_for_event(<<"status_update">>, 1000))),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    Statuses = statuses(),
+    ?assertEqual([<<"started">>, <<"completed">>], Statuses),
+
+    nh_agent:stop(Agent).
+
+%% The statuses sent until nothing is for a moment.
+statuses() ->
+    case next_sent(300) of
+        nothing_sent ->
+            [];
+        Frame ->
+            case json:decode(Frame) of
+                [_, _, _, <<"status_update">>, #{<<"status">> := Status}] -> [Status | statuses()];
+                _Other -> statuses()
+            end
+    end.
 
 %% With the socket closed for the download, what the download had to say goes
 %% once the device has joined again, in order.
@@ -485,9 +565,33 @@ statuses_made_while_closed_go_after_the_next_join_test() ->
 
     nh_agent:stop(Agent).
 
-%% A connection lost while the download runs has a reconnect waiting. The
-%% download ending opens the socket at once, and the waiting reconnect must
-%% not open a second one on top of it.
+%% Lost, not closed for the download, a connection keeps its backoff: the
+%% download ending does not open it early.
+a_connection_lost_during_the_download_keeps_its_backoff_test() ->
+    {Agent, JoinRef} = join(#{
+        keep_open_above => 60000, updater => nh_ota_resumed, reconnect_backoff => {1500, 1500}
+    }),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    wait_for_notice({update_started, '_'}, 1000),
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    receive
+        {opened, _, _} -> erlang:error(opened_before_the_backoff)
+    after 300 -> ok
+    end,
+
+    nh_agent:stop(Agent).
+
+%% A connection lost while the download runs has a reconnect waiting, with its
+%% backoff. The download ending leaves it to that reconnect, rather than open
+%% the socket at once and a second on top of it.
 a_connection_lost_during_the_download_is_opened_once_test() ->
     {Agent, JoinRef} = join(#{
         keep_open_above => 60000, updater => nh_ota_resumed, reconnect_backoff => {600, 600}

@@ -21,6 +21,7 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and its memory back. Status updates made while the socket is closed are sent
   once the device has joined again. Without the option nothing changes.
 - `before_update`, a function run before a download starts, to free memory.
+  One that does not return `ok` fails the update rather than the agent.
 
 ### Changed
 
@@ -40,9 +41,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   out of memory there. The first line always goes, however long.
 - An armed update counts as busy until the reboot: offered again before then,
   it is not downloaded into the other slot, which by then holds the previous
-  firmware.
+  firmware. The owner hears `{update_ignored, armed}`; `apply_update/2` gets
+  `{update_decision_ignored, armed}`, and `request_update/1` `{error, armed}`.
 - A status update made while the device is not joined (`started`, `completed`,
-  `failed`) waits for the next join, in order, rather than being dropped.
+  `failed`) waits for the next join, in order, rather than being dropped; the
+  latest of each status is kept.
 - A download resumes for as long as connections keep bringing bytes, in place
   of five retries in all. Each connection is read with a deadline,
   `resume_after_ms` (10 s): one that goes quiet, fails or closes short is

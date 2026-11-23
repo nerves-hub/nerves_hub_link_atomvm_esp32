@@ -65,7 +65,12 @@
 %%
 %% `before_update => Fun' is called before any of this, so the application can
 %% free memory first (its own TLS connections, say); it hears `update_failed'
-%% if the update does not happen.
+%% if the update does not happen, including when `Fun' does not return `ok'.
+%%
+%% An update armed for the next boot counts as busy until then: offers are
+%% ignored with `{update_ignored, armed}' to the owner, `apply_update/2' with
+%% `{update_decision_ignored, armed}', and `request_update/1' is answered
+%% `{error, armed}'.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_agent).
@@ -646,10 +651,15 @@ update_offered(Payload, State) ->
     case {Available, Busy, Requested orelse maps:get(updates, State, auto) =:= auto} of
         {false, _, _} ->
             State;
+        {true, true, _} when is_map_key(armed, State) ->
+            %% The owner hears it: a reboot that was put off, or that failed,
+            %% is what stands between the device and this offer, whichever
+            %% firmware it is.
+            notify(State, {update_ignored, armed}),
+            reply_request(request_update, {error, armed}, State);
         {true, true, _} ->
-            %% One at a time. A second `update' while a download is in flight,
-            %% or once one is armed, is the server repeating itself, not a new
-            %% job.
+            %% One at a time. A second `update' while a download is in flight
+            %% is the server repeating itself, not a new job.
             State;
         {true, false, true} ->
             %% Answered first: the socket may close for the download.
@@ -661,6 +671,11 @@ update_offered(Payload, State) ->
 update_decision(_Decision, #{update := _Pid} = State) ->
     notify(State, {update_decision_ignored, updating}),
     State;
+%% Armed, the slot a download would write is the one the device boots next, or
+%% the one it runs: the reboot comes first.
+update_decision({apply, _Payload}, #{armed := _Slot} = State) ->
+    notify(State, {update_decision_ignored, armed}),
+    State;
 update_decision({apply, Payload}, State) ->
     start_update(Payload, State);
 update_decision({ignore, Reason}, State) ->
@@ -670,7 +685,12 @@ update_decision({reschedule, DelayMs, Reason}, State) ->
 
 start_update(Payload, State0) ->
     State = status_update(<<"received">>, #{}, State0),
-    ok = before_update(State),
+    case before_update(State) of
+        ok -> download(Payload, State);
+        {error, Reason} -> update_failed(Reason, <<"before_update_failed">>, State)
+    end.
+
+download(Payload, State) ->
     State1 = make_room_for_download(State),
     %% `updater' is for the tests only, which put a fake downloader in nh_ota's
     %% place; it is not part of the documented config.
@@ -682,8 +702,15 @@ start_update(Payload, State0) ->
 %% The application's chance to free memory for the download (stop its own TLS
 %% connections, say) before the heap is measured and the download starts. It
 %% hears `update_failed' if the update does not happen, to start them again.
+%% One that does not return `ok' is the update not happening: the owner hears
+%% `{update_failed, {before_update, Result}}', and NervesHub that it failed.
 before_update(#{config := #{before_update := Fun}}) ->
-    ok = Fun();
+    try Fun() of
+        ok -> ok;
+        Other -> {error, {before_update, Other}}
+    catch
+        Class:Reason -> {error, {before_update, {Class, Reason}}}
+    end;
 before_update(_State) ->
     ok.
 
@@ -737,7 +764,7 @@ close_for_download(#{handle := Handle} = State) ->
     State1 = disconnect(State),
     await_gone(Monitor),
     timer:sleep(?RECLAIM_MS),
-    State1.
+    State1#{closed_for_download => true}.
 
 monitor_handle(Handle) when is_port(Handle) -> erlang:monitor(port, Handle);
 monitor_handle(Handle) when is_pid(Handle) -> erlang:monitor(process, Handle);
@@ -753,13 +780,15 @@ await_gone(Monitor) ->
         ok
     end.
 
-%% Joining again is left to `connected', as on any other connection. One that
-%% does not open is retried like any lost connection. A connection lost during
-%% the download already has a reconnect waiting, which would open a second.
-reopen(#{handle := undefined} = State) ->
-    reconnect(cancel_timer(reconnect, State#{reconnect_attempt => 0}));
+%% Only a socket closed for the download opens again at once. Joining again is
+%% left to `connected', as on any other connection, and one that does not open
+%% is retried like any lost connection. A connection lost during the download,
+%% not closed for it, keeps the reconnect and backoff it already has.
+reopen(#{closed_for_download := true, handle := undefined} = State) ->
+    State1 = maps:remove(closed_for_download, State),
+    reconnect(cancel_timer(reconnect, State1#{reconnect_attempt => 0}));
 reopen(State) ->
-    State.
+    maps:remove(closed_for_download, State).
 
 %% `download_resume_after_ms' and `download_resumes' reach the downloader as
 %% its `resume_after_ms' and `resumes': a device on a link whose handshake
@@ -835,9 +864,19 @@ status_update(Status, Extra, State) ->
     case
         maps:get(handle, State) =/= undefined andalso nh_channel:joined(maps:get(channel, State))
     of
-        true -> push_event(<<"status_update">>, Payload, State);
-        false -> State#{deferred => maps:get(deferred, State) ++ [Payload]}
+        true ->
+            push_event(<<"status_update">>, Payload, State);
+        %% The latest of each: a download that resumes says `started' again
+        %% each time, and NervesHub needs only where it got to.
+        false ->
+            State#{
+                deferred => [P || P <- maps:get(deferred, State), not same_status(P, Status)] ++
+                    [Payload]
+            }
     end.
+
+same_status(#{<<"status">> := Status}, Status) -> true;
+same_status(_Payload, _Status) -> false.
 
 send_deferred(#{deferred := []} = State) ->
     State;
@@ -879,6 +918,9 @@ call(Request, From, Tag, State) ->
             State;
         Kind =:= request_update, is_map_key(update, State) ->
             reply(From, Tag, {error, updating}),
+            State;
+        Kind =:= request_update, is_map_key(armed, State) ->
+            reply(From, Tag, {error, armed}),
             State;
         true ->
             send_request(Request, Kind, From, Tag, State)

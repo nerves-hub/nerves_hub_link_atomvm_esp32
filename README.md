@@ -141,6 +141,8 @@ The calling process receives `{nerves_hub, Event}`:
 | `{download_resumed, Offset}` | The download reconnected and asked for the rest from `Offset` |
 | `{update_ready, Slot}` | Written and armed; reboot when convenient |
 | `{update_failed, Reason}` | Refused, or the write failed |
+| `{update_ignored, armed}` | An offer while an update waits for the reboot |
+| `{update_decision_ignored, updating \| armed}` | `apply_update/2` while one downloads or waits for the reboot |
 | `{firmware_committed, Slot}` | The running update proved itself |
 | `{firmware_trial, Slot, Boot}` | Booted firmware that has not proved itself yet |
 | `{firmware_reverted, Slot}` | It did not; the device boots `Slot` next |
@@ -239,8 +241,19 @@ closes the socket while an update downloads, unless the largest free block of
 heap is at least `Bytes` as the download starts, and reopens it afterwards;
 `never` always closes it. The owner hears `{download_socket, open | closed,
 LargestFreeBlock}`, and what NervesHub would have heard while the socket was
-closed is sent, in order, once the device has joined again. `before_update`
-runs before any of this, so the application can free memory of its own first.
+closed is sent, in order, once the device has joined again: the latest of each
+status, so a download resumed many times is one `started`. Only a socket closed
+for the download opens again at once; one lost during it keeps its reconnect
+backoff. `before_update` runs before any of this, so the application can free
+memory of its own first; if it returns anything but `ok`, or raises, the update
+fails (`{update_failed, {before_update, Result}}`) and nothing is downloaded.
+
+An update armed and waiting for the reboot counts as busy: NervesHub offers it
+again on the next join, and downloading it would write over a slot the device
+needs. Until the reboot, an offer is ignored and the owner hears
+`{update_ignored, armed}`; `apply_update/2` is answered with
+`{update_decision_ignored, armed}`, and `request_update/1` with
+`{error, armed}`.
 
 A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
 short is dropped, and the rest is asked for from the last byte received with a
