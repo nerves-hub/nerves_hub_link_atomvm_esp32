@@ -69,6 +69,20 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The console's up and down arrows walk through the last 20 lines entered, as
   a shell does, and `clear` clears the screen (and prints nothing in a support
   script). A line is at most 256 bytes.
+- The `alarms` extension (0.1.0): with `extensions => [alarms]` and an
+  `alarms => Fun`, the agent asks for the alarms every `alarms_interval_ms`
+  (30 s by default) and sends `alarms:raised` / `alarms:cleared` as they
+  change, and `alarms:snapshot` when NervesHub sends `alarms:sync`. Alarms
+  raised while offline keep the time they were raised. With it attached, the
+  health report leaves the `alarms` key out. A `Fun` of one argument is given
+  the set it returned last time, for hysteresis without state of its own; a
+  callback that fails leaves what was raised as it was.
+- `alarms => Fun` alone puts the application's alarms on the health report,
+  which sent `#{}` before.
+
+### Changed
+
+- `extensions => all` includes `alarms`.
 
 ## [0.2.0] - 2026-09-24
 
