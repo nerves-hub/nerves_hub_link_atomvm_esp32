@@ -128,7 +128,7 @@ cleanup(_) ->
 install_test_() ->
     {setup, fun setup/0, fun cleanup/1, [
         {"the bytes written are the bytes downloaded", fun bytes_written_match/0},
-        {"the slot is erased before anything is written", fun erases_first/0},
+        {"each sector is erased just before it is written", fun erases_as_it_writes/0},
         {"the boot path moves last", fun boot_path_moves_last/0}
     ]}.
 
@@ -139,9 +139,13 @@ bytes_written_match() ->
     Written = nh_ota_fake_esp:written(),
     ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))).
 
-erases_first() ->
-    %% 10000 bytes rounds up to three 4096 byte sectors.
-    ?assertEqual([{?SLOT, 0, 12288}], nh_ota_fake_esp:erased()).
+erases_as_it_writes() ->
+    %% 10000 bytes: two whole sectors and a tail, each erased on its own (the
+    %% fake refuses a write to a sector that was not erased, see
+    %% `nh_ota_fake_esp'), never the whole archive at once.
+    ?assertEqual(
+        [{?SLOT, 0, 4096}, {?SLOT, 4096, 4096}, {?SLOT, 8192, 4096}], nh_ota_fake_esp:erased()
+    ).
 
 boot_path_moves_last() ->
     Nvs = nh_ota_fake_esp:nvs(),
@@ -187,6 +191,42 @@ a_failed_write_stops_the_install_test() ->
     ?assertMatch({error, {write_failed, _, _}}, Result),
     %% And nothing was armed, so the device still boots what it had.
     ?assertEqual(undefined, maps:get({atomvm, boot_path}, Nvs, undefined)).
+
+%% An archive bigger than the slot it would overwrite is refused before
+%% anything is erased: a device whose partition table is older than the
+%% application keeps what it boots, untouched.
+an_archive_bigger_than_the_slot_is_refused_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body()),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+    Small = byte_size(body()) - 1,
+    ok = nh_ota_fake_esp:partitions([{?SLOT, 1, 64, 16#290000, Small, []}]),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{})),
+    Erased = nh_ota_fake_esp:erased(),
+
+    cleanup(ok),
+    ?assertEqual({error, {update_too_big, byte_size(body()), Small}}, Result),
+    ?assertEqual([], Erased).
+
+%% A slot just as big as the archive takes it; a list that does not name the
+%% slot has nothing to check against.
+an_archive_that_fits_the_slot_goes_in_test_() ->
+    [
+        ?_test(fits([{?SLOT, 1, 64, 16#290000, byte_size(body()), []}])),
+        ?_test(fits([{<<"other">>, 1, 64, 16#10000, 1, []}]))
+    ].
+
+fits(Partitions) ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body()),
+    ok = nh_ota_fake_flash:expect(#{avm_sha256 => digest(body())}),
+    ok = nh_ota_fake_esp:partitions(Partitions),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{})),
+
+    cleanup(ok),
+    ?assertEqual({ok, ?SLOT}, Result).
 
 a_refused_connection_is_an_error_not_a_crash_test() ->
     ok = nh_ota_fake_esp:start(),
@@ -386,8 +426,11 @@ a_server_that_ignores_range_is_taken_from_the_start_test() ->
     cleanup(ok),
     ?assertEqual({ok, ?SLOT}, Result),
     ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))),
-    %% Erased again before the rewrite, since flash cannot be written twice.
-    ?assertEqual(2, length(Erased)).
+    %% The first sector written before the drop at 5000, then all three again
+    %% for the rewrite: flash cannot be written twice between erases.
+    ?assertEqual(
+        [{?SLOT, 0, 4096}, {?SLOT, 0, 4096}, {?SLOT, 4096, 4096}, {?SLOT, 8192, 4096}], Erased
+    ).
 
 a_download_that_keeps_dropping_gives_up_test() ->
     ok = nh_ota_fake_esp:start(),
