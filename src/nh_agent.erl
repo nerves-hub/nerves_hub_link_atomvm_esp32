@@ -73,6 +73,12 @@
 -define(REBOOT_GRACE_MS, 250).
 
 -define(DEFAULT_HEARTBEAT_MS, 30000).
+%% WebSocket pings, which the transport sends. ESP-IDF's own default is every
+%% 10 s, and on a metered link that is most of an idle device's traffic. The
+%% heartbeats keep the socket open on NervesHub's side and the NAT mapping on
+%% the way; the pings are only how the device notices a dead link, which IDF
+%% gives up on 120 s after an unanswered one. At 60 s that is at most 3 minutes.
+-define(DEFAULT_PING_INTERVAL_MS, 60000).
 -define(DEFAULT_RECONNECT_BACKOFF, {1000, 60000}).
 %% A connection that has not come up in this long is not going to.
 -define(DEFAULT_CONNECT_TIMEOUT_MS, 30000).
@@ -1125,7 +1131,4 @@ transport_config(Config, Url) ->
             CertAndKey -> WithAuth#{client_cert => CertAndKey}
         end,
 
-    case maps:get(ping_interval_ms, Config, undefined) of
-        undefined -> WithCert;
-        Ms -> WithCert#{ping_interval_ms => Ms}
-    end.
+    WithCert#{ping_interval_ms => maps:get(ping_interval_ms, Config, ?DEFAULT_PING_INTERVAL_MS)}.
