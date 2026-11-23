@@ -11,6 +11,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for a device that moves between networks without restarting the agent.
 - `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,
   passed to the transport.
+- `nerves_hub_link:flush_logs/2` sends the log lines waiting for a batch, for
+  an application about to restart the device on purpose.
 
 ### Changed
 
@@ -28,6 +30,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after a rejoin, when the TLS handshake has just taken its share of the heap,
   and a hundred lines of a few hundred bytes each ran an ESP32 without PSRAM
   out of memory there. The first line always goes, however long.
+- Log lines no longer wait for the batch timer when the device may be about
+  to go down: a line at `error` or worse, and any line while an update
+  downloads, goes soon, and a `reboot` sends what is waiting first. A batch
+  still waiting went with a panic. The first such line goes at once and the
+  ones within the next 250 ms together after it, so a burst of errors is a
+  few messages a second, inside NervesHub's limit of 5, not one per line.
 
 ### Fixed
 
@@ -40,15 +48,6 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSON-encoded in the agent, which on AtomVM costs the process many times the
   output's size in heap: a 2 KB answer with quotes in it took more than an
   ESP32 without PSRAM had in one block, and the device panicked.
-- `nerves_hub_link:flush_logs/2` sends the log lines waiting for a batch, for
-  an application about to restart the device on purpose.
-
-### Changed
-
-- Log lines no longer wait for the batch timer when the device may be about
-  to go down: a line at `error` or worse, and any line while an update
-  downloads, is sent at once, and a `reboot` sends what is waiting first. A
-  batch still waiting went with a panic.
 
 ## [0.2.0] - 2026-09-24
 
