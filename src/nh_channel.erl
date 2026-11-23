@@ -338,8 +338,26 @@ mark_left(Topic, State) ->
 next_ref(#{ref := Ref} = State) ->
     {integer_to_binary(Ref), State#{ref => Ref + 1}}.
 
+%% A batch of log lines is encoded a line at a time. The whole batch in one
+%% `json:encode' grows the agent's heap by several times the frame at once: on
+%% an ESP32 without PSRAM, a 2 KB batch took 9 KB off the lowest free heap of
+%% the boot, the flush after the extensions attach. Each line becomes a binary,
+%% off the process heap, before the next is encoded.
+frame(JoinRef, Ref, Topic, Event, #{<<"lines">> := Lines} = Payload) when
+    map_size(Payload) =:= 1, is_list(Lines)
+->
+    Head = iolist_to_binary(json:encode([JoinRef, Ref, Topic, Event])),
+    Open = binary:part(Head, 0, byte_size(Head) - 1),
+    iolist_to_binary([Open, <<",{\"lines\":[">>, encode_lines(Lines, []), <<"]}]">>]);
 frame(JoinRef, Ref, Topic, Event, Payload) ->
     iolist_to_binary(json:encode([JoinRef, Ref, Topic, Event, Payload])).
+
+encode_lines([], Encoded) ->
+    lists:reverse(Encoded);
+encode_lines([Line | Rest], []) ->
+    encode_lines(Rest, [iolist_to_binary(json:encode(Line))]);
+encode_lines([Line | Rest], Encoded) ->
+    encode_lines(Rest, [iolist_to_binary(json:encode(Line)), <<",">> | Encoded]).
 
 decode(Text) ->
     try json:decode(Text) of

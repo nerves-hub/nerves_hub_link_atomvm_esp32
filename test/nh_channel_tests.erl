@@ -109,6 +109,29 @@ push_after_join_test() ->
     ?assertEqual(<<"update_progress">>, Event),
     ?assertEqual(#{<<"value">> => 42}, Payload).
 
+%% A batch of log lines is encoded a line at a time, and decodes as the
+%% whole batch encoded at once would.
+push_log_lines_test() ->
+    {State, _} = joined_channel(),
+    Lines = [
+        #{
+            <<"level">> => <<"info">>,
+            <<"message">> => <<"a \"quoted\" ção\n"/utf8>>,
+            <<"meta">> => #{<<"time">> => <<"1">>}
+        },
+        #{<<"level">> => <<"error">>, <<"message">> => <<"b">>, <<"meta">> => #{}}
+    ],
+    lists:foreach(
+        fun(Payload) ->
+            {_State1, [{send, Frame}]} = nh_channel:push(<<"logging:send">>, Payload, State),
+            [_JoinRef, _Ref, Topic, Event, Decoded] = decode_frame(Frame),
+            ?assertEqual(<<"device">>, Topic),
+            ?assertEqual(<<"logging:send">>, Event),
+            ?assertEqual(Payload, Decoded)
+        end,
+        [#{<<"lines">> => Lines}, #{<<"lines">> => tl(Lines)}, #{<<"lines">> => []}]
+    ).
+
 refs_are_unique_test() ->
     State0 = nh_channel:new(params()),
     {State1, [{send, F1}]} = nh_channel:connected(State0),

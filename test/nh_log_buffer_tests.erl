@@ -36,6 +36,32 @@ full_drops_the_oldest_test() ->
     ?assertEqual(<<"warning">>, maps:get(<<"level">>, Notice)),
     ?assertEqual(0, nh_log_buffer:dropped(Rest)).
 
+sized(Bytes) -> #{<<"message">> => binary:copy(<<"x">>, Bytes)}.
+
+with(Lines) ->
+    lists:foldl(fun nh_log_buffer:add/2, nh_log_buffer:new(10), Lines).
+
+stops_before_the_byte_limit_test() ->
+    {Lines, Rest} = nh_log_buffer:take(10, 1000, with([sized(400), sized(400), sized(400)])),
+    ?assertEqual(2, length(Lines)),
+    ?assertEqual(1, nh_log_buffer:size(Rest)).
+
+a_line_that_fills_the_limit_exactly_goes_test() ->
+    {Lines, Rest} = nh_log_buffer:take(10, 800, with([sized(400), sized(400), sized(1)])),
+    ?assertEqual(2, length(Lines)),
+    ?assertEqual(1, nh_log_buffer:size(Rest)).
+
+%% Otherwise one long line would sit at the front of the buffer forever.
+the_first_line_goes_even_past_the_limit_test() ->
+    {Lines, Rest} = nh_log_buffer:take(10, 100, with([sized(500), sized(10)])),
+    ?assertEqual([500], [byte_size(maps:get(<<"message">>, L)) || L <- Lines]),
+    ?assertEqual(1, nh_log_buffer:size(Rest)).
+
+the_line_limit_still_applies_test() ->
+    {Lines, Rest} = nh_log_buffer:take(2, 1000, with([sized(1), sized(1), sized(1)])),
+    ?assertEqual(2, length(Lines)),
+    ?assertEqual(1, nh_log_buffer:size(Rest)).
+
 %% The notice counts towards the batch, so a batch never grows past its limit.
 the_notice_counts_towards_the_batch_test() ->
     {Lines, Rest} = nh_log_buffer:take(2, filled(3, 5)),

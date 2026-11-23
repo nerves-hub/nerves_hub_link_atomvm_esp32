@@ -16,7 +16,8 @@ open(Config) ->
 
 send_text(fake_handle, Frame) ->
     ?MODULE ! {sent, Frame},
-    ok.
+    %% What the transport answers; a test can make it something else.
+    application:get_env(?MODULE, send_reply, ok).
 
 close(fake_handle) ->
     ?MODULE ! closed,
@@ -75,6 +76,27 @@ joins_only_once_connected_test() ->
     ?assertEqual(<<"phx_join">>, Event),
     ?assertEqual(<<"my_app">>, maps:get(<<"atomvm_app_name">>, Payload)),
 
+    nh_agent:stop(Agent).
+
+%% atomvm_websocket_client's port answers a bare `not_connected' when the socket
+%% closed under a queued send. A send that fails is reported, whatever shape the
+%% failure takes, and the agent carries on rather than crashing its owner.
+a_send_that_fails_in_any_shape_is_reported_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(config(#{})),
+    _ = next_opened(),
+    ok = application:set_env(?MODULE, send_reply, not_connected),
+    try
+        Agent ! {websocket, fake_handle, connected},
+        _Join = next_sent(1000),
+        receive
+            {nerves_hub, {send_failed, Reason}} -> ?assertEqual(not_connected, Reason)
+        after 1000 -> ?assert(false)
+        end,
+        ?assert(is_process_alive(Agent))
+    after
+        application:unset_env(?MODULE, send_reply)
+    end,
     nh_agent:stop(Agent).
 
 %% The whole reason the agent watches for `connected' rather than joining once:
@@ -175,6 +197,18 @@ surfaces_join_and_messages_test() ->
     Agent ! {websocket, fake_handle, {text, iolist_to_binary(Update)}},
     ?assertMatch({message, <<"update">>, #{<<"firmware_url">> := _}}, next_event(1000)),
 
+    nh_agent:stop(Agent).
+
+%% Pings are the transport's business; the agent only passes the interval on,
+%% once a minute unless told otherwise rather than the IDF's every 10 s.
+passes_the_ping_interval_to_the_transport_test() ->
+    setup(),
+    {ok, Default} = nh_agent:start(config(#{})),
+    ?assertEqual(60000, maps:get(ping_interval_ms, next_opened())),
+    nh_agent:stop(Default),
+
+    {ok, Agent} = nh_agent:start(config(#{ping_interval_ms => 15000})),
+    ?assertEqual(15000, maps:get(ping_interval_ms, next_opened())),
     nh_agent:stop(Agent).
 
 %% ------------------------------------------------------------------- helpers
@@ -562,6 +596,21 @@ a_full_batch_goes_at_once_test() ->
 
     nh_agent:stop(Agent).
 
+%% Long lines go in more than one batch, the rest at the next flush.
+a_batch_stops_at_its_byte_limit_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 200}, [<<"logging">>], advert()
+    ),
+
+    Long = binary:copy(<<"x">>, nh_ext_logs:max_batch_bytes() div 2 + 1),
+    [ok = nerves_hub_link:send_log(Agent, <<"info">>, Long) || _ <- [1, 2, 3]],
+    #{<<"lines">> := First} = wait_for_event(<<"logging:send">>, 2000),
+    #{<<"lines">> := Second} = wait_for_event(<<"logging:send">>, 2000),
+    #{<<"lines">> := Third} = wait_for_event(<<"logging:send">>, 2000),
+    ?assertEqual([1, 1, 1], [length(First), length(Second), length(Third)]),
+
+    nh_agent:stop(Agent).
+
 %% ------------------------------------------------------------------ actions
 
 send_device(Agent, JoinRef, Event) ->
@@ -735,6 +784,40 @@ the_network_interface_is_reported_on_join_test() ->
         #{<<"interface">> => <<"eth0">>}, wait_for_event(<<"report_network_interface">>, 1000)
     ),
 
+    nh_agent:stop(Agent).
+
+%% A device that moves between networks without restarting the agent says
+%% which one it is on as it joins.
+a_network_interface_function_is_asked_on_each_join_test() ->
+    Key = {?MODULE, interface},
+    persistent_term:put(Key, <<"eth0">>),
+    setup(),
+    {ok, Agent} = nh_agent:start(
+        config(#{
+            reconnect_backoff => {10, 20},
+            network_interface => fun() -> persistent_term:get(Key) end
+        })
+    ),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef, Ref | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef, Ref, <<"device">>),
+    ?assertEqual(
+        #{<<"interface">> => <<"eth0">>}, wait_for_event(<<"report_network_interface">>, 1000)
+    ),
+
+    persistent_term:put(Key, <<"wwan0">>),
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    ?assertEqual(
+        #{<<"interface">> => <<"wwan0">>}, wait_for_event(<<"report_network_interface">>, 1000)
+    ),
+
+    persistent_term:erase(Key),
     nh_agent:stop(Agent).
 
 %% --------------------------------------------------------------------- scripts

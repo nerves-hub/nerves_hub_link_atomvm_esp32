@@ -73,6 +73,12 @@
 -define(REBOOT_GRACE_MS, 250).
 
 -define(DEFAULT_HEARTBEAT_MS, 30000).
+%% WebSocket pings, which the transport sends. ESP-IDF's own default is every
+%% 10 s, and on a metered link that is most of an idle device's traffic. The
+%% heartbeats keep the socket open on NervesHub's side and the NAT mapping on
+%% the way; the pings are only how the device notices a dead link, which IDF
+%% gives up on 120 s after an unanswered one. At 60 s that is at most 3 minutes.
+-define(DEFAULT_PING_INTERVAL_MS, 60000).
 -define(DEFAULT_RECONNECT_BACKOFF, {1000, 60000}).
 %% A connection that has not come up in this long is not going to.
 -define(DEFAULT_CONNECT_TIMEOUT_MS, 30000).
@@ -105,10 +111,13 @@
     handler => pid(),
     heartbeat_ms => pos_integer(),
     reconnect_backoff => {pos_integer(), pos_integer()},
-    network_interface => binary(),
+    %% A function is asked on each join and download, for a device that
+    %% changes network without restarting the agent.
+    network_interface => binary() | fun(() -> binary()),
     firmware_trial => #{boot_attempts => pos_integer(), join_timeout_ms => pos_integer()} | off,
     log_flush_ms => pos_integer(),
-    log_buffer => pos_integer()
+    log_buffer => pos_integer(),
+    ping_interval_ms => pos_integer()
 }.
 
 -export_type([config/0]).
@@ -380,6 +389,13 @@ run_action({send, Frame}, State) ->
                 ok ->
                     State;
                 {error, Reason} ->
+                    notify(State, {send_failed, Reason}),
+                    State;
+                %% atomvm_websocket_client's port answered a bare
+                %% `not_connected' (or `send_failed') rather than the
+                %% `{error, _}' it documents, before nerves-hub/
+                %% atomvm_websocket_client#3.
+                Reason ->
                     notify(State, {send_failed, Reason}),
                     State
             end
@@ -957,7 +973,9 @@ flush_logs(State0) ->
         true ->
             case logging_mode(State) of
                 batched ->
-                    {Lines, Rest} = nh_log_buffer:take(nh_ext_logs:max_batch(), Buffer),
+                    {Lines, Rest} = nh_log_buffer:take(
+                        nh_ext_logs:max_batch(), nh_ext_logs:max_batch_bytes(), Buffer
+                    ),
                     State1 = push_extension(
                         nh_ext_logs:event(), nh_ext_logs:batch(Lines), State#{log_buffer => Rest}
                     ),
@@ -1063,7 +1081,10 @@ now_ms() ->
     erlang:system_time(millisecond).
 
 network_interface(#{config := Config}) ->
-    maps:get(network_interface, Config, ?DEFAULT_NETWORK_INTERFACE).
+    case maps:get(network_interface, Config, ?DEFAULT_NETWORK_INTERFACE) of
+        Fun when is_function(Fun, 0) -> Fun();
+        Interface -> Interface
+    end.
 
 %% What the device reports about itself on every join: its firmware, which
 %% protocol version it speaks, whether that firmware has proved itself, and
@@ -1119,7 +1140,10 @@ transport_config(Config, Url) ->
                 Base
         end,
 
-    case maps:get(client_cert, Config, undefined) of
-        undefined -> WithAuth;
-        CertAndKey -> WithAuth#{client_cert => CertAndKey}
-    end.
+    WithCert =
+        case maps:get(client_cert, Config, undefined) of
+            undefined -> WithAuth;
+            CertAndKey -> WithAuth#{client_cert => CertAndKey}
+        end,
+
+    WithCert#{ping_interval_ms => maps:get(ping_interval_ms, Config, ?DEFAULT_PING_INTERVAL_MS)}.
