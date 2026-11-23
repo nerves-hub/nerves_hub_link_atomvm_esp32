@@ -47,6 +47,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   have their own. An agent started again under the name used to
   get a new capture each time, and the old one stayed alive sending to the dead
   agent, along with every process that had inherited it.
+- Console output longer than one 256-byte piece is encoded in a short-lived
+  process, not on the agent's heap. Encoding a piece builds several times its
+  size in garbage (every quote in a command's JSON output is escaped); on the
+  agent's heap that garbage grew it into one contiguous block of its whole new
+  size, which an ESP32 without PSRAM short of memory did not have for a
+  1.1 KB answer. Shorter output (the echo of a keystroke,
+  a prompt) stays where it was: a process per keystroke would fragment the
+  heap instead.
 
 ## [0.2.0] - 2026-09-24
 

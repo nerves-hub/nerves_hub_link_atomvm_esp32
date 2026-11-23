@@ -403,6 +403,35 @@ a_command_answers_on_the_console_topic_test() ->
 
     nh_agent:stop(Agent).
 
+%% Only output longer than one piece is encoded in a helper process: one per
+%% keystroke fragmented a device's memory.
+only_long_output_is_encoded_in_a_helper_test() ->
+    {Agent, JoinRef} = join_with_console(),
+    _Banner = wait_for_event(<<"up">>, 1000),
+    erlang:trace(Agent, true, [procs]),
+
+    send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"h">>}),
+    ?assertEqual(#{<<"data">> => <<"h">>}, wait_for_event(<<"up">>, 1000)),
+    ?assertEqual([], spawns(Agent)),
+
+    %% `help' answers with more than one piece.
+    send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"elp\r">>}),
+    Data = console_until_prompt(<<>>),
+    ?assert(byte_size(Data) > 256),
+    ?assertMatch([_], spawns(Agent)),
+
+    erlang:trace(Agent, false, [procs]),
+    nh_agent:stop(Agent).
+
+%% The processes Agent spawned, as the trace has told so far.
+spawns(Agent) ->
+    receive
+        {trace, Agent, spawn, Pid, _} -> [Pid | spawns(Agent)];
+        {trace, Agent, _Event, _Info} -> spawns(Agent);
+        {trace, Agent, _Event, _Info, _} -> spawns(Agent)
+    after 100 -> []
+    end.
+
 %% Output longer than one piece arrives in several `up's; the prompt ends it.
 console_until_prompt(Acc) ->
     #{<<"data">> := Data} = wait_for_event(<<"up">>, 1000),
