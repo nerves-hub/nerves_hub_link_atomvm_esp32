@@ -988,8 +988,11 @@ updater({ok, Slot}, State) ->
     %% device on its own is a library that surprises someone.
     notify(State, {update_ready, Slot}),
     ok = remember_armed(),
+    %% Two `maps:remove/2' rather than `maps:without/2', which AtomVM lacks.
     State1 = status_update(
-        <<"completed">>, #{}, (maps:without([held, updating], State))#{failed_updates => 0}
+        <<"completed">>,
+        #{},
+        (maps:remove(held, maps:remove(updating, State)))#{failed_updates => 0}
     ),
     reopen(cancel_timer(update_idle, maps:remove(update, State1#{armed => Slot})));
 updater({error, Reason}, State) ->
