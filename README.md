@@ -139,9 +139,10 @@ The calling process receives `{nerves_hub, Event}`:
 | `{update_started, Pid}` | An update is downloading |
 | `{download_socket, open \| closed, Largest}` | With `keep_open_above`: whether the socket stays open for the download |
 | `{download_resumed, Offset}` | The download reconnected and asked for the rest from `Offset` |
-| `{update_ready, Slot}` | Written and armed; reboot when convenient |
+| `{update_ready, Slot}` | Written and armed; reboot when convenient. Heard again from an agent started before the reboot |
 | `{update_failed, Reason}` | Refused, or the write failed |
 | `{update_ignored, armed}` | An offer while an update waits for the reboot |
+| `{update_ignored, backing_off}` | The firmware that just failed, offered again before `update_retry_backoff` is over |
 | `{update_decision_ignored, updating \| armed}` | `apply_update/2` while one downloads or waits for the reboot |
 | `{firmware_committed, Slot}` | The running update proved itself |
 | `{firmware_trial, Slot, Boot}` | Booted firmware that has not proved itself yet |
@@ -214,12 +215,19 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `log_flush_ms` | 10000 | How long batched log lines wait |
 | `log_buffer` | 100 | Log lines held before the oldest are dropped |
 | `ping_interval_ms` | 60000 | WebSocket pings; the IDF on its own sends them every 10 s |
+| `connect_timeout_ms` | 30000 | How long a connection may take to come up |
+| `download_idle_ms` | 120000 | How long the agent waits to hear from a download before giving up on it. Never less than the downloader's own resumes need |
 | `download_resume_after_ms` | 10000 | How long a download connection may stay quiet before it is resumed. See [updates](#updates) |
 | `download_resumes` | 3 | Download connections in a row that bring nothing before giving up |
 | `keep_open_above` | unset: open | Close the socket while an update downloads unless this many bytes are free in one block, or `never` to always close. See [updates](#updates) |
 | `before_update` | none | A function run before a download starts, to free memory |
 | `update_retry_backoff` | `{30000, 3600000}` | First and longest wait before joining again after a failed update, in ms |
 | `transport` | `websocket_client` | |
+
+The numbers are checked at start: one that is not a positive integer (or, for
+the backoffs, a `{Min, Max}` pair of them with `Min =< Max`; for
+`keep_open_above`, a non-negative integer or `never`) is
+`{error, {invalid_config, Key, Value}}` from `start_link`.
 
 ## Updates
 
@@ -252,16 +260,25 @@ fails (`{update_failed, {before_update, Result}}`) and nothing is downloaded.
 
 NervesHub offers an update again only when the device joins. After a failed
 update the device joins again, after `update_retry_backoff`: 30 s, doubling
-with each failure in a row up to an hour, back to the start once an update
-succeeds. A socket kept open for the download reconnects; one closed for it
-opens again then, and NervesHub hears of the failure on that join.
+with each failure in a row up to an hour (plus up to half again, so devices
+do not all come back at once), back to the start once an update succeeds.
+Until then the firmware that failed is held: offered again sooner -- a socket
+closed for the download opens again at once, so that the device stays
+reachable, and NervesHub offers it on that join -- it is not downloaded, and
+the owner hears `{update_ignored, backing_off}`. NervesHub hears of the failure
+on that join. A different firmware is not held, and nor is an update the
+application asks for with `request_update/1`.
 
 An update armed and waiting for the reboot counts as busy: NervesHub offers it
 again on the next join, and downloading it would write over a slot the device
 needs. Until the reboot, an offer is ignored and the owner hears
 `{update_ignored, armed}`; `apply_update/2` is answered with
 `{update_decision_ignored, armed}`, and `request_update/1` with
-`{error, armed}`.
+`{error, armed}`. An agent started again before the reboot knows it too: it
+does not take the armed update for one the device has booted (counting a boot,
+committing it on the first join), and the owner hears `{update_ready, Slot}`
+again. That takes a small registered process, `nh_armed`, which waits from the
+arming until the reboot ends it.
 
 A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
 short is dropped, and the rest is asked for from the last byte received with a
@@ -276,7 +293,10 @@ these two. The deadline covers each connection's DNS lookup, TCP connect, TLS
 handshake and first byte as well as the reads: on a link whose handshake often
 takes longer than 10 s, raise `download_resume_after_ms`. A download the agent
 hears nothing from for `download_idle_ms` (two minutes) is given up on; a
-resume counts as hearing from it.
+resume counts as hearing from it. It never gives up sooner than the download's
+own resumes allow, `(download_resumes + 1) * download_resume_after_ms`, so
+raising the deadline for a slow link does not have the agent end a download
+that is waiting to reconnect.
 
 The connection is read by a process of its own, and a quiet one is ended by
 killing that process: AtomVM's `ssl:recv/2` has no deadline and cannot be

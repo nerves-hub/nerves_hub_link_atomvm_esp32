@@ -45,8 +45,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   again: before, a socket that stayed open never asked again, and the device
   kept its old firmware until something else made it reconnect. It waits
   `update_retry_backoff` first (30 s, doubling with each failure in a row up
-  to an hour), so a failure that repeats at once is not a loop; a socket closed
-  for the download waits the same before it opens again.
+  to an hour), so a failure that repeats at once is not a loop. Until then the
+  firmware that failed is held: offered again sooner, it is not downloaded,
+  and the owner hears `{update_ignored, backing_off}`. A socket closed for the
+  download opens again at once, so the device stays reachable.
 - `before_update`, a function run before a download starts, to free memory.
   One that does not return `ok` fails the update rather than the agent.
 
@@ -102,6 +104,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of failing halfway through the download with the slot already half
   rewritten.
 - `extensions => all` includes `alarms`.
+- The agent gives up on a quiet download after `download_idle_ms` or after
+  `(download_resumes + 1) * download_resume_after_ms`, whichever is longer.
+  Raising `download_resume_after_ms` for a slow link had the agent end a
+  download as stalled while it waited to reconnect.
+- The numbers in the config are checked at start: one that is not a positive
+  integer (a `{Min, Max}` pair of them for the backoffs; a non-negative integer
+  or `never` for `keep_open_above`) is `{error, {invalid_config, Key, Value}}`
+  from `start_link`. `nerves_hub_link:config()` lists every key the agent reads.
 
 ### Fixed
 
@@ -132,6 +142,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process's state, and with it the device's private key, to the serial log and
   the crash report; a fun prints as `#Fun<..>`. Either may also be given as
   such a fun.
+- An agent started again before the reboot took an armed update for one the
+  device had booted: it counted a boot that never happened, committed the
+  update on the first join, and would download the next offer over the slot
+  the device runs from. A small registered process, `nh_armed`, now marks an
+  armed update until the reboot, and the owner hears `{update_ready, Slot}`
+  again from the new agent.
 - An update written and armed for the next boot was committed by any join
   before the reboot, while the device still ran the firmware it had: the slot
   a failed boot goes back to was dropped, and NervesHub heard the old firmware

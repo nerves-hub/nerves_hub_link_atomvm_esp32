@@ -161,6 +161,10 @@
 %% fail and be offered again every few seconds, each round a TLS handshake.
 -define(DEFAULT_UPDATE_RETRY_BACKOFF, {30000, 3600000}).
 
+%% Registered while an update is armed and the device has not rebooted yet. See
+%% armed_or_trial/1.
+-define(ARMED_MARKER, nh_armed).
+
 -type config() :: #{
     url => binary() | string(),
     host => binary() | string(),
@@ -180,6 +184,7 @@
     log_flush_ms => pos_integer(),
     log_buffer => pos_integer(),
     ping_interval_ms => pos_integer(),
+    connect_timeout_ms => pos_integer(),
     alarms_interval_ms => pos_integer(),
     download_idle_ms => pos_integer(),
     download_resume_after_ms => pos_integer(),
@@ -284,7 +289,7 @@ init(Config, Owner) ->
         timers => #{}
     },
 
-    State1 = schedule_alarms(begin_trial(State0)),
+    State1 = schedule_alarms(armed_or_trial(State0)),
     Channel = maybe_add_extensions(
         maybe_add_console(nh_channel:new(join_params(State1)), Config), Extensions
     ),
@@ -394,10 +399,13 @@ disconnect(#{handle := undefined} = State) ->
 disconnect(#{transport := Transport, handle := Handle} = State0) ->
     _ = Transport:close(Handle),
     State1 = fail_requests(disconnected, State0),
+    %% `rejoin' stays: the join after a reconnect comes while the failed
+    %% firmware is still held, so it is the rejoin that asks again once the
+    %% backoff is over. With the socket down when it fires, it does nothing.
     State2 = lists:foldl(
         fun cancel_timer/2,
         State1,
-        [heartbeat, connect_timeout, extensions_fallback, log_flush, rejoin]
+        [heartbeat, connect_timeout, extensions_fallback, log_flush]
     ),
     State2#{
         handle => undefined,
@@ -448,8 +456,6 @@ fire(poll_alarms, State) ->
 %% before the new connection asks for its own.
 fire(rejoin, State) ->
     reopen(close_for_download(State));
-fire(reopen, State) ->
-    reopen(State);
 fire({request, Kind}, State) ->
     reply_request(Kind, {error, timeout}, State);
 fire({script, Ref}, State) ->
@@ -626,6 +632,56 @@ handle_event(Other, State) ->
 
 %% --------------------------------------------------------------- the trial
 
+%% A pending slot means one of two things, and NVS cannot say which: the device
+%% rebooted into the update and is on trial, or an agent before this one armed
+%% it and the device has not rebooted yet, still running what it had. The
+%% marker an armed update leaves (see `remember_armed/0') tells them apart: it
+%% outlives the agent, not the VM. Taken for a trial, an update not yet booted
+%% would be counted a boot, committed on the first join, and the next offer
+%% downloaded over the slot the device runs from.
+armed_or_trial(State) ->
+    case {whereis(?ARMED_MARKER), nh_ota:pending(ota_opts(State))} of
+        {Marker, {ok, Slot}} when is_pid(Marker) ->
+            %% The owner may be new too, and not know a reboot is waiting.
+            notify(State, {update_ready, Slot}),
+            State#{trial => none, armed => Slot};
+        {Marker, none} when is_pid(Marker) ->
+            %% Committed or reverted since: the marker is stale.
+            forget_armed(),
+            begin_trial(State);
+        {undefined, _} ->
+            begin_trial(State)
+    end.
+
+%% A registered process that only waits: there while the VM runs, gone with a
+%% reboot. AtomVM has no `persistent_term', and anything kept in NVS or RTC
+%% memory would survive the reboot it is meant to notice.
+remember_armed() ->
+    forget_armed(),
+    Marker = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    try register(?ARMED_MARKER, Marker) of
+        true -> ok
+    catch
+        %% Another agent armed it at the same moment; one marker is enough.
+        error:badarg -> Marker ! stop
+    end,
+    ok.
+
+forget_armed() ->
+    case whereis(?ARMED_MARKER) of
+        undefined ->
+            ok;
+        Marker ->
+            %% Unregistered first, so a new marker can take the name at once.
+            catch unregister(?ARMED_MARKER),
+            Marker ! stop,
+            ok
+    end.
+
 %% Counted before anything else can go wrong, so a firmware that crashes on the
 %% way to connecting still uses up a boot. See `nh_ota:begin_trial/2'.
 begin_trial(#{config := Config} = State) ->
@@ -712,6 +768,7 @@ ota_opts(#{esp := Esp}) -> #{esp => Esp}.
 update_offered(Payload, State) ->
     Available = maps:get(<<"update_available">>, Payload, false) =:= true,
     Requested = maps:is_key(request_update, maps:get(requests, State)),
+    Auto = maps:get(updates, State, auto) =:= auto,
     %% Armed counts as busy until the reboot. A socket closed for the download
     %% reopens once the update is written, and NervesHub, still seeing the old
     %% firmware, offers it again. Downloading that would write into the other
@@ -719,24 +776,32 @@ update_offered(Payload, State) ->
     %% needs to go back to.
     Busy = maps:is_key(update, State) orelse maps:is_key(armed, State),
 
-    case {Available, Busy, Requested orelse maps:get(updates, State, auto) =:= auto} of
-        {false, _, _} ->
+    case {Available, Busy} of
+        {false, _} ->
             State;
-        {true, true, _} when is_map_key(armed, State) ->
+        {true, true} when is_map_key(armed, State) ->
             %% The owner hears it: a reboot that was put off, or that failed,
             %% is what stands between the device and this offer, whichever
             %% firmware it is.
             notify(State, {update_ignored, armed}),
             reply_request(request_update, {error, armed}, State);
-        {true, true, _} ->
+        {true, true} ->
             %% One at a time. A second `update' while a download is in flight
             %% is the server repeating itself, not a new job.
             State;
-        {true, false, true} ->
+        {true, false} when Requested ->
             %% Answered first: the socket may close for the download.
             start_update(Payload, reply_request(request_update, ok, State));
-        {true, false, false} ->
-            State
+        {true, false} ->
+            case {held(Payload, State), Auto} of
+                {true, _} ->
+                    notify(State, {update_ignored, backing_off}),
+                    State;
+                {false, true} ->
+                    start_update(Payload, State);
+                {false, false} ->
+                    State
+            end
     end.
 
 update_decision(_Decision, #{update := _Pid} = State) ->
@@ -754,13 +819,13 @@ update_decision({ignore, Reason}, State) ->
 update_decision({reschedule, DelayMs, Reason}, State) ->
     status_update(<<"rescheduled">>, #{<<"delay_for">> => DelayMs, <<"reason">> => Reason}, State).
 
-%% A join or reopen still waiting out the backoff of an earlier failure is
-%% for that failure: firing in the middle of this download, it would close a
-%% socket kept open and connect again, a second TLS handshake beside the
-%% download's. Should this one fail, it sets its own.
+%% A rejoin still waiting out the backoff of an earlier failure is for that
+%% failure: firing in the middle of this download, it would close a socket
+%% kept open and connect again, a second TLS handshake beside the download's.
+%% Should this one fail, it sets its own, and holds its own firmware.
 start_update(Payload, State0) ->
-    State1 = cancel_timer(rejoin, cancel_timer(reopen, State0)),
-    State = status_update(<<"received">>, #{}, State1),
+    State1 = maps:remove(held, cancel_timer(rejoin, State0)),
+    State = status_update(<<"received">>, #{}, State1#{updating => firmware_id(Payload)}),
     case before_update(State) of
         ok -> download(Payload, State);
         {error, Reason} -> update_failed(Reason, <<"before_update_failed">>, State)
@@ -880,8 +945,15 @@ download_opts(#{config := Config} = State) ->
     ).
 
 %% Everything the downloader says is a sign it is still getting somewhere.
-download_alive(#{config := Config} = State) ->
-    set_timer(update_idle, maps:get(download_idle_ms, Config, ?DEFAULT_DOWNLOAD_IDLE_MS), State).
+download_alive(State) ->
+    set_timer(update_idle, download_idle_ms(State), State).
+
+%% Never shorter than the downloader may stay quiet while it still has resumes
+%% left: a device on a slow link that raises `download_resume_after_ms' would
+%% otherwise have the download ended as stalled while it waited to reconnect.
+download_idle_ms(#{config := Config} = State) ->
+    Configured = maps:get(download_idle_ms, Config, ?DEFAULT_DOWNLOAD_IDLE_MS),
+    max(Configured, nh_ota:quiet_limit(download_opts(State))).
 
 updater_message(Pid, Message, #{update := Pid} = State) ->
     updater(Message, State);
@@ -915,7 +987,10 @@ updater({ok, Slot}, State) ->
     %% call: it may have work to finish first, and a library that restarts a
     %% device on its own is a library that surprises someone.
     notify(State, {update_ready, Slot}),
-    State1 = status_update(<<"completed">>, #{}, State#{failed_updates => 0}),
+    ok = remember_armed(),
+    State1 = status_update(
+        <<"completed">>, #{}, (maps:without([held, updating], State))#{failed_updates => 0}
+    ),
     reopen(cancel_timer(update_idle, maps:remove(update, State1#{armed => Slot})));
 updater({error, Reason}, State) ->
     update_failed(Reason, describe(Reason), State).
@@ -928,24 +1003,51 @@ update_stalled(State) ->
 
 %% Reported now if the socket stayed open and joined; otherwise on the next join.
 %%
-%% NervesHub offers an update again only when the device joins again. With
-%% the socket kept open, nothing would ever ask again, so it reconnects; with
-%% it closed for the download, it opens again. Either waits
-%% `update_retry_backoff', longer with each failure in a row.
+%% NervesHub offers an update again only when the device joins again, so after
+%% `update_retry_backoff' (longer with each failure in a row) it joins again.
+%% Until then the firmware that failed is held: offered again before that --
+%% on the join a socket closed for the download opens with at once, or a
+%% reconnect -- it is not downloaded, and the owner hears
+%% `{update_ignored, backing_off}'. A failure that repeats at once (a 404, a
+%% bad signature, an archive too big for the slot) would otherwise be offered,
+%% fail and be offered again every few seconds. A different firmware is not
+%% held, and nor is an update the application asked for.
+%%
+%% A socket closed for the download opens again at once rather than after the
+%% backoff: the download that needed its memory is over, and closed, the device
+%% is out of reach for as long as an hour.
 update_failed(Reason, Described, State) ->
     notify(State, {update_failed, Reason}),
     State1 = status_update(<<"failed">>, #{<<"reason">> => Described}, State),
     State2 = cancel_timer(update_idle, maps:remove(update, State1)),
     Failures = maps:get(failed_updates, State2, 0),
     Delay = update_retry_delay(Failures, State2),
-    State3 = State2#{failed_updates => Failures + 1},
-    case {maps:get(handle, State3), maps:get(closed_for_download, State3, false)} of
-        %% Closed for the download: it opens again after the backoff, and the
-        %% failure goes to NervesHub on that join.
-        {undefined, true} -> set_timer(reopen, Delay, State3);
-        %% Lost during the download: its own reconnect is waiting.
-        {undefined, false} -> State3;
-        {_Open, _} -> set_timer(rejoin, Delay, State3)
+    State3 = set_timer(
+        rejoin,
+        Delay,
+        maps:remove(updating, State2#{
+            failed_updates => Failures + 1,
+            held => {maps:get(updating, State2, undefined), now_ms() + Delay}
+        })
+    ),
+    %% Lost during the download rather than closed for it, its own reconnect
+    %% is waiting; reopen/1 leaves that alone.
+    reopen(State3).
+
+%% The firmware an offer is for: its UUID, or failing that its URL without the
+%% query, which for a presigned URL changes with every offer.
+firmware_id(#{<<"firmware_meta">> := #{<<"uuid">> := Uuid}}) ->
+    Uuid;
+firmware_id(#{<<"firmware_url">> := Url}) when is_binary(Url) ->
+    hd(binary:split(Url, <<"?">>));
+firmware_id(_Payload) ->
+    undefined.
+
+%% Whether an offer is for the firmware that failed, while its backoff runs.
+held(Payload, State) ->
+    case maps:get(held, State, undefined) of
+        {Id, Until} when Id =/= undefined -> Id =:= firmware_id(Payload) andalso now_ms() < Until;
+        _ -> false
     end.
 
 update_retry_delay(Failures, #{config := Config}) ->
