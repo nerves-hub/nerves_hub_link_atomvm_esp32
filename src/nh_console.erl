@@ -67,6 +67,9 @@
 %% Lines kept for the arrows: enough to repeat a session's few commands,
 %% little enough to cost nothing on a device without PSRAM.
 -define(HISTORY, 20).
+%% The longest line kept: what is typed past it is not echoed or kept, so a
+%% line and its history stay bounded on a device without PSRAM.
+-define(MAX_LINE, 256).
 %% Back to the start of the line and erase it, so a recalled line replaces
 %% what was there; and the whole screen, for `clear'.
 -define(ERASE_LINE, <<"\r\e[K">>).
@@ -198,7 +201,11 @@ fold_input(<<$\n, Rest/binary>>, State, Acc) ->
     submit(Rest, State, Acc);
 fold_input(<<?TAB, Rest/binary>>, State, Acc) ->
     fold_input(Rest, State, Acc);
-%% Anything else printable joins the line and is echoed.
+%% Anything else printable joins the line and is echoed, up to `?MAX_LINE'.
+fold_input(<<Byte, Rest/binary>>, #{line := Line} = State, Acc) when
+    Byte >= 32, Byte < 127, byte_size(Line) >= ?MAX_LINE
+->
+    fold_input(Rest, State, Acc);
 fold_input(<<Byte, Rest/binary>>, #{line := Line} = State, Acc) when Byte >= 32, Byte < 127 ->
     fold_input(Rest, State#{line => <<Line/binary, Byte>>}, [<<Byte>> | Acc]);
 fold_input(<<_Byte, Rest/binary>>, State, Acc) ->
@@ -336,20 +343,23 @@ run_command(Line) ->
             {ok, <<>>};
         {Command, _Args} ->
             case lists:keymember(Command, 1, commands()) of
+                %% Its escape codes would end up raw in the script's output.
+                true when Command =:= <<"clear">> -> {ok, <<>>};
                 true -> {ok, run(Line, [])};
                 false -> {error, run(Line, [])}
             end
     end.
 
 %% An application's command of a built-in's name replaces it, in `help' as
-%% when it runs.
+%% when it runs. `help' itself comes first.
 help(Commands) ->
     Own = [Name || {_Section, Name, _Description, _Fun} <- Commands],
     All =
-        [
-            Command
-         || {_Section, Name, _Description} = Command <- built_in(), not lists:member(Name, Own)
-        ] ++
+        [{<<"device">>, <<"help">>, <<"this list">>}] ++
+            [
+                Command
+             || {_Section, Name, _Description} = Command <- built_in(), not lists:member(Name, Own)
+            ] ++
             [{Section, Name, Description} || {Section, Name, Description, _Fun} <- Commands],
     Sections = lists:foldl(
         fun({Section, _, _}, Seen) ->
@@ -378,13 +388,22 @@ help(Commands) ->
 %% The application's, or else a built-in one.
 execute({_Section, _Name, _Description, Fun}, _Command, Args) ->
     try
-        iolist_to_binary(Fun(Args))
+        ended(iolist_to_binary(Fun(Args)))
     catch
         Class:Reason ->
             iolist_to_binary(io_lib:format("~p: ~p~ts", [Class, Reason, ?EOL]))
     end;
 execute(false, Command, Args) ->
     execute(Command, Args).
+
+%% Output that does not end a line would run into the prompt (`r1 onesp32> ').
+ended(<<>>) ->
+    <<>>;
+ended(Output) ->
+    case binary:last(Output) of
+        $\n -> Output;
+        _ -> <<Output/binary, (?EOL)/binary>>
+    end.
 
 execute(<<"clear">>, _Args) ->
     ?CLEAR_SCREEN;

@@ -344,12 +344,21 @@ console_commands => [
 ]
 ```
 
-`Fun` gets the line's arguments and returns the output (iodata). It runs in the
-agent, so it must be quick; one that raises prints the error instead of taking
-the console down. `help` lists the commands by section: the built-in ones are
-in `device` and `network`, an application's goes in the section it names or in
-`application`. One with a built-in's name replaces it. Support scripts run the
-built-in commands only.
+`Fun` gets the line's arguments and returns the output (iodata); a line end is
+added if it has none. One that raises prints the error instead of taking the
+console down. `help` lists the commands by section: the built-in ones are in
+`device` and `network`, an application's goes in the section it names or in
+`application`. One with a built-in's name replaces it; `help` itself cannot be
+replaced. Names, sections and descriptions are binaries, and an entry that is
+not is refused at start with `{error, {invalid_console_command, Entry}}`.
+Support scripts run the built-in commands only, and `clear` prints nothing
+there.
+
+`Fun` runs in the agent's process. While it runs, the agent sends no heartbeat
+and reads no frame, so it must be quick. It must not call `nerves_hub_link`:
+those calls go to the agent and would wait on themselves until they time out.
+
+A line is at most 256 bytes; what is typed past that is not kept.
 
 It reports, and it reboots. It will not evaluate Erlang, and it is not a way in
 to a running system.

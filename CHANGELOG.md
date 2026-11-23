@@ -43,9 +43,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `console_commands` adds the application's own console commands, as `{Name,
   Description, Fun}` or `{Section, Name, Description, Fun}`. `help` lists the
   commands by section (`device`, `network`, then the application's); one with a
-  built-in's name replaces it, and one that raises prints the error.
+  built-in's name replaces it, and one that raises prints the error. A wrong
+  entry, or one named `help`, is refused at start as
+  `{invalid_console_command, Entry}`.
 - The console's up and down arrows walk through the last 20 lines entered, as
-  a shell does, and `clear` clears the screen.
+  a shell does, and `clear` clears the screen (and prints nothing in a support
+  script). A line is at most 256 bytes.
 
 ## [0.2.0] - 2026-09-24
 

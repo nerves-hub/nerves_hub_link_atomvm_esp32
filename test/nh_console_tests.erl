@@ -247,3 +247,28 @@ an_application_command_replaces_a_built_in_test() ->
     ?assertMatch({_, _}, binary:match(Help, <<"the app's net">>)),
     ?assertEqual(nomatch, binary:match(Help, <<"network address and signal">>)),
     ?assertMatch({_, _}, binary:match(Net, <<"mine">>)).
+
+%% `help' lists itself, first.
+help_lists_itself_test() ->
+    {_, Help} = nh_console:handle_input(<<"help\r">>, nh_console:new()),
+    {Help1, _} = binary:match(Help, <<"help">>),
+    {Info, _} = binary:match(Help, <<"info">>),
+    ?assert(Help1 < Info),
+    ?assertMatch({_, _}, binary:match(Help, <<"this list">>)).
+
+%% An application's output without a line end does not run into the prompt.
+output_ends_its_line_test() ->
+    State = nh_console:new([{<<"r1">>, <<"relay">>, fun(_) -> <<"r1 on">> end}]),
+    {_, Out} = nh_console:handle_input(<<"r1\r">>, State),
+    ?assertMatch({_, _}, binary:match(Out, <<"r1 on\r\nesp32> ">>)).
+
+%% Past the longest line, typing is neither kept nor echoed.
+a_line_has_a_length_limit_test() ->
+    {State, Echo} = nh_console:handle_input(binary:copy(<<"a">>, 300), nh_console:new()),
+    ?assertEqual(256, byte_size(Echo)),
+    {_, Out} = nh_console:handle_input(<<"\r">>, State),
+    ?assertMatch({_, _}, binary:match(Out, binary:copy(<<"a">>, 256))).
+
+%% A script that clears gets no escape codes in its output.
+clear_in_a_script_prints_nothing_test() ->
+    ?assertEqual({ok, <<>>}, nh_console:run_command(<<"clear">>)).
