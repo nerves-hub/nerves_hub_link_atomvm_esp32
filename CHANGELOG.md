@@ -7,6 +7,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `network_interface` may be a function, asked on each join and download,
+  for a device that moves between networks without restarting the agent.
 - `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,
   passed to the transport.
 
