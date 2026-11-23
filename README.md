@@ -210,6 +210,8 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `log_flush_ms` | 10000 | How long batched log lines wait |
 | `log_buffer` | 100 | Log lines held before the oldest are dropped |
 | `ping_interval_ms` | 60000 | WebSocket pings; the IDF on its own sends them every 10 s |
+| `download_resume_after_ms` | 10000 | How long a download connection may stay quiet before it is resumed. See [updates](#updates) |
+| `download_resumes` | 3 | Download connections in a row that bring nothing before giving up |
 | `transport` | `websocket_client` | |
 
 ## Updates
@@ -234,10 +236,18 @@ a row that brought no new byte; one that brought any starts the count again, so
 a slow link that keeps moving takes as many connections as it needs. After one
 that brought nothing it waits `resume_after_ms` times that count. A 5xx counts
 as a connection that brought nothing; a failure another connection would not
-fix, such as a 404 or a flash write that failed, ends it at once. Both
-numbers are options of `nh_ota:apply_update/2`; the agent uses the defaults. A
-download the agent hears nothing from for `download_idle_ms` (two minutes) is
-given up on; a resume counts as hearing from it.
+fix, such as a 404 or a flash write that failed, ends it at once. The agent
+passes `download_resume_after_ms` and `download_resumes` from its config as
+these two. The deadline covers each connection's DNS lookup, TCP connect, TLS
+handshake and first byte as well as the reads: on a link whose handshake often
+takes longer than 10 s, raise `download_resume_after_ms`. A download the agent
+hears nothing from for `download_idle_ms` (two minutes) is given up on; a
+resume counts as hearing from it.
+
+The connection is read by a process of its own, and a quiet one is ended by
+killing that process: AtomVM's `ssl:recv/2` has no deadline and cannot be
+woken. Its socket and TLS session go with it, since AtomVM frees a process's
+resources when it dies, so the next connection does not wait for room.
 
 ### Deciding for yourself
 

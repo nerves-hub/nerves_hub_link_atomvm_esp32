@@ -305,6 +305,43 @@ a_resumed_download_is_not_given_up_test() ->
 
     nh_agent:stop(Agent).
 
+%% A device on a slow link sets the download's deadlines from the agent's
+%% config; left out, the downloader's defaults stand.
+the_download_options_come_from_the_config_test() ->
+    Test = self(),
+    Probe = spawn(fun Forward() ->
+        receive
+            stop ->
+                ok;
+            Message ->
+                Test ! Message,
+                Forward()
+        end
+    end),
+    true = register(nh_ota_opts_probe, Probe),
+    Update = #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    },
+    Opts = fun(Config) ->
+        {Agent, JoinRef} = join(Config#{updater => nh_ota_opts}),
+        send_update(Agent, JoinRef, Update),
+        receive
+            {opts, O} ->
+                nh_agent:stop(Agent),
+                O
+        after 1000 -> erlang:error(no_update)
+        end
+    end,
+    Set = Opts(#{download_resume_after_ms => 30000, download_resumes => 5}),
+    ?assertMatch(#{resume_after_ms := 30000, resumes := 5}, Set),
+    Default = Opts(#{}),
+    ?assertNot(is_map_key(resume_after_ms, Default)),
+    ?assertNot(is_map_key(resumes, Default)),
+    Probe ! stop.
+
 %% `update_available => false' is NervesHub saying there is nothing to do.
 an_unavailable_update_starts_nothing_test() ->
     {Agent, JoinRef} = join(#{}),

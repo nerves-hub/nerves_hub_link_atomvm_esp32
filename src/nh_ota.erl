@@ -183,7 +183,7 @@ fetch(Slot, Parsed, Size, Checksum, Progress, Opts) ->
         written => 0,
         received => 0,
         resumes => 0,
-        since => 0,
+        furthest => 0,
         stuck => 0,
         buffer => <<>>,
         hash => crypto:hash_init(sha256),
@@ -204,7 +204,10 @@ fetch(Slot, Parsed, Size, Checksum, Progress, Opts) ->
 %% telling `resumed' the byte it resumed from. It gives up once `resumes'
 %% connections in a row (3 by default) brought no new byte: one that brought
 %% any starts the count again, since a slow link can take several connections
-%% to carry an archive. After one that brought nothing it waits before the
+%% to carry an archive. A new byte is one past the furthest any connection
+%% reached: a server that ignores `Range' starts again from 0 each time, and
+%% bytes it sends again are not progress, so a link that cuts every
+%% connection at the same point still gives up. After one that brought nothing it waits before the
 %% next, `resume_after_ms' times the count: a modem with no route for a few
 %% seconds fails every connect at once, and would otherwise spend all of
 %% `resumes' in a fraction of a second. The sha256 at the end still covers the
@@ -218,6 +221,9 @@ recv_loop({Reader, _Monitor} = R, #{opts := Opts} = State) ->
     receive
         {?MODULE, Reader, {responses, Responses}} ->
             case handle(Responses, State) of
+                %% A response can end short of the size: it was cut.
+                {done, #{size := Size, received := Received} = Final} when Received < Size ->
+                    resume(R, {error, {incomplete, Received}}, Final);
                 {done, Final} ->
                     stop_reader(R),
                     flush(Final);
@@ -248,12 +254,17 @@ recv_loop({Reader, _Monitor} = R, #{opts := Opts} = State) ->
         resume(R, {error, download_stalled}, State)
     end.
 
+%% Every byte arrived and only the end of the response did not: asking for
+%% `bytes=Size-' would be answered 416, so it is done.
+resume(R, _Error, #{size := Size, received := Received} = State) when Received >= Size ->
+    stop_reader(R),
+    flush(State);
 resume(R, Error, State) ->
-    #{opts := Opts, resumes := Resumes, received := Received, since := Since, stuck := Stuck} =
+    #{opts := Opts, resumes := Resumes, received := Received, furthest := Furthest, stuck := Stuck} =
         State,
     stop_reader(R),
     Stuck1 =
-        case Received > Since of
+        case Received > Furthest of
             true -> 0;
             false -> Stuck + 1
         end,
@@ -261,7 +272,9 @@ resume(R, Error, State) ->
         true ->
             _ = (maps:get(resumed, Opts, fun(_Offset) -> ok end))(Received),
             _ = timer:sleep(Stuck1 * maps:get(resume_after_ms, Opts, ?RESUME_AFTER_MS)),
-            Next = State#{resumes => Resumes + 1, since => Received, stuck => Stuck1},
+            Next = State#{
+                resumes => Resumes + 1, furthest => max(Furthest, Received), stuck => Stuck1
+            },
             recv_loop(start_reader(Next), Next);
         false ->
             Error
@@ -365,7 +378,6 @@ restart(#{slot := Slot, size := Size, opts := Opts} = State) ->
                 offset => 0,
                 written => 0,
                 received => 0,
-                since => 0,
                 buffer => <<>>,
                 hash => crypto:hash_init(sha256)
             }};

@@ -117,7 +117,10 @@
     firmware_trial => #{boot_attempts => pos_integer(), join_timeout_ms => pos_integer()} | off,
     log_flush_ms => pos_integer(),
     log_buffer => pos_integer(),
-    ping_interval_ms => pos_integer()
+    ping_interval_ms => pos_integer(),
+    download_idle_ms => pos_integer(),
+    download_resume_after_ms => pos_integer(),
+    download_resumes => pos_integer()
 }.
 
 -export_type([config/0]).
@@ -623,10 +626,25 @@ update_decision({reschedule, DelayMs, Reason}, State) ->
 
 start_update(Payload, State0) ->
     State = status_update(<<"received">>, #{}, State0),
+    %% `updater' is for the tests only, which put a fake downloader in nh_ota's
+    %% place; it is not part of the documented config.
     Updater = maps:get(updater, maps:get(config, State), nh_ota),
-    Pid = Updater:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
+    Pid = Updater:start_update(Payload, self(), download_opts(State)),
     notify(State, {update_started, Pid}),
     download_alive(State#{update => Pid}).
+
+%% `download_resume_after_ms' and `download_resumes' reach the downloader as
+%% its `resume_after_ms' and `resumes': a device on a link whose handshake
+%% often takes longer than the 10 s default raises them.
+download_opts(#{config := Config} = State) ->
+    Passed = [
+        {resume_after_ms, download_resume_after_ms},
+        {resumes, download_resumes}
+    ],
+    maps:from_list(
+        [{keys, maps:get(firmware_keys, State, [])}] ++
+            [{Opt, maps:get(Key, Config)} || {Opt, Key} <- Passed, is_map_key(Key, Config)]
+    ).
 
 %% Everything the downloader says is a sign it is still getting somewhere.
 download_alive(#{config := Config} = State) ->

@@ -269,6 +269,41 @@ it_gives_up_after_connections_in_a_row_that_bring_nothing_test() ->
     ?assertEqual(4, length(Ranges)),
     ?assertEqual([1000, 1000, 1000], Resumed).
 
+%% A server that ignores `Range' sends the archive from 0 each time. On a link
+%% that cuts every connection at the same point, those bytes are not progress:
+%% it gives up, rather than erase and rewrite the same part forever.
+a_range_ignored_and_cut_at_the_same_point_gives_up_test() ->
+    ok = nh_ota_fake_esp:start(),
+    ok = nh_ota_fake_http:serve(body(), #{drops => [5000, 5000, 5000, 5000, 5000], ranges => false}),
+    ok = nh_ota_fake_flash:expect(#{}),
+
+    Result = nh_ota:apply_update(payload(body()), opts(#{resumes => 3, resume_after_ms => 10})),
+    Requests = nh_ota_fake_http:requests(),
+
+    cleanup(ok),
+    ?assertMatch({error, {stream_failed, closed}}, Result),
+    %% The first, which brought 5000 bytes, and three that brought nothing new.
+    ?assertEqual(4, length(Requests)).
+
+%% Every byte arrived and the response's end did not: asking for the rest would
+%% be answered 416. It is done.
+every_byte_arrived_but_not_the_end_is_done_test() ->
+    {Result, Written, Ranges, Resumed} = resume([{byte_size(body()), stall}], #{}),
+
+    ?assertEqual({ok, ?SLOT}, Result),
+    ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))),
+    ?assertEqual([none], Ranges),
+    ?assertEqual([], Resumed).
+
+%% A response that ends cleanly short of the size was cut: the rest is asked for.
+a_response_that_ends_short_is_resumed_test() ->
+    {Result, Written, Ranges, Resumed} = resume([{5000, done}], #{}),
+
+    ?assertEqual({ok, ?SLOT}, Result),
+    ?assertEqual(body(), binary:part(Written, 0, byte_size(body()))),
+    ?assertEqual([none, <<"bytes=5000-">>], Ranges),
+    ?assertEqual([5000], Resumed).
+
 a_refused_connection_is_tried_again_test() ->
     ok = nh_ota_fake_esp:start(),
     ok = nh_ota_fake_http:fail_connect(),
