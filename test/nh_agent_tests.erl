@@ -16,7 +16,8 @@ open(Config) ->
 
 send_text(fake_handle, Frame) ->
     ?MODULE ! {sent, Frame},
-    ok.
+    %% What the transport answers; a test can make it something else.
+    application:get_env(?MODULE, send_reply, ok).
 
 close(fake_handle) ->
     ?MODULE ! closed,
@@ -75,6 +76,27 @@ joins_only_once_connected_test() ->
     ?assertEqual(<<"phx_join">>, Event),
     ?assertEqual(<<"my_app">>, maps:get(<<"atomvm_app_name">>, Payload)),
 
+    nh_agent:stop(Agent).
+
+%% atomvm_websocket_client's port answers a bare `not_connected' when the socket
+%% closed under a queued send. A send that fails is reported, whatever shape the
+%% failure takes, and the agent carries on rather than crashing its owner.
+a_send_that_fails_in_any_shape_is_reported_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(config(#{})),
+    _ = next_opened(),
+    ok = application:set_env(?MODULE, send_reply, not_connected),
+    try
+        Agent ! {websocket, fake_handle, connected},
+        _Join = next_sent(1000),
+        receive
+            {nerves_hub, {send_failed, Reason}} -> ?assertEqual(not_connected, Reason)
+        after 1000 -> ?assert(false)
+        end,
+        ?assert(is_process_alive(Agent))
+    after
+        application:unset_env(?MODULE, send_reply)
+    end,
     nh_agent:stop(Agent).
 
 %% The whole reason the agent watches for `connected' rather than joining once:
@@ -175,6 +197,18 @@ surfaces_join_and_messages_test() ->
     Agent ! {websocket, fake_handle, {text, iolist_to_binary(Update)}},
     ?assertMatch({message, <<"update">>, #{<<"firmware_url">> := _}}, next_event(1000)),
 
+    nh_agent:stop(Agent).
+
+%% Pings are the transport's business; the agent only passes the interval on,
+%% once a minute unless told otherwise rather than the IDF's every 10 s.
+passes_the_ping_interval_to_the_transport_test() ->
+    setup(),
+    {ok, Default} = nh_agent:start(config(#{})),
+    ?assertEqual(60000, maps:get(ping_interval_ms, next_opened())),
+    nh_agent:stop(Default),
+
+    {ok, Agent} = nh_agent:start(config(#{ping_interval_ms => 15000})),
+    ?assertEqual(15000, maps:get(ping_interval_ms, next_opened())),
     nh_agent:stop(Agent).
 
 %% ------------------------------------------------------------------- helpers

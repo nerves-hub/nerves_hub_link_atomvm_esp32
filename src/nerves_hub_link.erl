@@ -245,6 +245,7 @@
     register => atom(),
     handler => pid(),
     heartbeat_ms => pos_integer(),
+    ping_interval_ms => pos_integer(),
     transport => module()
 }.
 
