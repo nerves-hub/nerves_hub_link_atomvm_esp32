@@ -342,6 +342,389 @@ the_download_options_come_from_the_config_test() ->
     ?assertNot(is_map_key(resumes, Default)),
     Probe ! stop.
 
+%% Asked to, the socket closes for the download: what the download says goes
+%% back to NervesHub once the device has joined again.
+a_socket_closed_for_the_download_reports_after_the_next_join_test() ->
+    {Agent, JoinRef} = join(#{keep_open_above => never, update_retry_backoff => {100, 100}}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    %% Off a device there is no block to measure.
+    ?assertEqual({download_socket, closed, undefined}, next_event(1000)),
+    ?assertMatch({update_started, _Pid}, next_event(1000)),
+    ?assertMatch({update_failed, no_flash_access}, next_event(2000)),
+
+    %% Accepted first, before the socket closes for the download.
+    Received = wait_for_event(<<"status_update">>, 2000),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, Received)),
+
+    %% the socket was closed for the download and reopened after it
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+
+    %% and the failure goes back to NervesHub once it has joined again
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    Reported = wait_for_event(<<"status_update">>, 2000),
+    ?assertEqual(<<"failed">>, maps:get(<<"status">>, Reported)),
+    ?assertEqual(<<"no_flash_access">>, maps:get(<<"reason">>, Reported)),
+
+    nh_agent:stop(Agent).
+
+%% With room for two TLS sessions the socket stays open, and off a device there
+%% is no heap to measure, so any threshold keeps it open.
+a_socket_with_room_stays_open_for_the_download_test() ->
+    {Agent, JoinRef} = join(#{keep_open_above => 60000}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertEqual({download_socket, open, undefined}, next_event(1000)),
+    ?assertMatch({update_started, _Pid}, next_event(1000)),
+    ?assertMatch({update_failed, no_flash_access}, next_event(2000)),
+    _Received = wait_for_event(<<"status_update">>, 1000),
+    Reported = wait_for_event(<<"status_update">>, 1000),
+    ?assertEqual(<<"no_flash_access">>, maps:get(<<"reason">>, Reported)),
+
+    nh_agent:stop(Agent).
+
+%% NervesHub offers an update again only on a join. With the socket open
+%% throughout, progress and the failure go out at once, and then it
+%% reconnects so that the next join asks again.
+a_failure_with_the_socket_open_reconnects_after_reporting_test() ->
+    {Agent, JoinRef} = join(#{
+        updater => nh_ota_progress_failed, update_retry_backoff => {200, 200}
+    }),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertMatch({update_started, _Pid}, next_event(1000)),
+
+    Progress = wait_for_event(<<"update_progress">>, 1000),
+    ?assertEqual(42, maps:get(<<"value">>, Progress)),
+
+    ?assertMatch({update_failed, no_flash_access}, next_event(2000)),
+    Reported = wait_for_event(<<"status_update">>, 1000),
+    ?assertEqual(<<"no_flash_access">>, maps:get(<<"reason">>, Reported)),
+
+    receive
+        closed -> ok
+    after 3000 -> erlang:error(never_rejoined)
+    end,
+    _ = next_opened(),
+
+    nh_agent:stop(Agent).
+
+%% Closed for the download, the socket opens again after the backoff too: a
+%% failure that repeats at once is not offered, failed and offered again every
+%% few seconds.
+a_failure_with_the_socket_closed_waits_before_opening_test() ->
+    {Agent, JoinRef} = join(#{
+        keep_open_above => never,
+        updater => nh_ota_progress_failed,
+        update_retry_backoff => {600, 600}
+    }),
+    send_update(Agent, JoinRef, update()),
+    ?assertEqual(closed, next_closed()),
+    wait_for_notice({update_failed, '_'}, 1000),
+    receive
+        {opened, _, _} -> erlang:error(opened_before_the_backoff)
+    after 400 -> ok
+    end,
+    _ = next_opened(),
+
+    nh_agent:stop(Agent).
+
+%% Each failure in a row waits longer before the next join.
+failures_in_a_row_wait_longer_test() ->
+    {Agent, JoinRef} = join(#{
+        updater => nh_ota_progress_failed, update_retry_backoff => {200, 10000}
+    }),
+    First = fail_and_rejoin(Agent, JoinRef),
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    flush_events(),
+    Second = fail_and_rejoin(Agent, JoinRef2),
+    %% 200 to 300 ms, then 400 to 600: the second always longer.
+    ?assert(First >= 200),
+    ?assert(Second > First + 50),
+
+    nh_agent:stop(Agent).
+
+%% How long from the failure until the socket closed to join again.
+fail_and_rejoin(Agent, JoinRef) ->
+    send_update(Agent, JoinRef, update()),
+    wait_for_notice({update_failed, '_'}, 1000),
+    Failed = erlang:monotonic_time(millisecond),
+    receive
+        closed -> ok
+    after 5000 -> erlang:error(never_rejoined)
+    end,
+    Took = erlang:monotonic_time(millisecond) - Failed,
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    Took.
+
+update() ->
+    #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }.
+
+%% The application frees its memory before the download starts.
+before_update_runs_before_the_download_test() ->
+    Self = self(),
+    {Agent, JoinRef} = join(#{
+        before_update => fun() ->
+            Self ! before_update,
+            ok
+        end
+    }),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    receive
+        before_update -> ok
+    after 1000 -> erlang:error(no_before_update)
+    end,
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertMatch({update_started, _Pid}, next_event(1000)),
+
+    nh_agent:stop(Agent).
+
+keep_open_needs_a_block_that_large_test() ->
+    ?assertNot(nh_agent:keep_open(never, 100000)),
+    ?assertNot(nh_agent:keep_open(never, undefined)),
+    ?assert(nh_agent:keep_open(60000, undefined)),
+    ?assert(nh_agent:keep_open(60000, 60000)),
+    ?assertNot(nh_agent:keep_open(60000, 59999)).
+
+%% Once an update is written and armed, NervesHub -- still seeing the old
+%% firmware -- offers it again on the next join. Downloading it would write
+%% into the other slot, by then the previous firmware: the one a failed update
+%% has to go back to. Until the reboot, an armed update is busy.
+an_armed_update_is_not_downloaded_again_test() ->
+    {Agent, JoinRef} = join(#{updater => nh_ota_resumed}),
+
+    %% a download that finishes and arms the other slot
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    flush_events(),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    %% The owner hears why: the reboot it put off is what stands in the way.
+    ?assertEqual({update_ignored, armed}, next_event(1000)),
+    ?assertEqual(no_event, next_event(300)),
+
+    nh_agent:stop(Agent).
+
+%% Applied by hand, an update while another is armed is refused the same way,
+%% and so is asking for one.
+an_armed_update_refuses_a_manual_apply_and_a_request_test() ->
+    Update = #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    },
+    {Agent, JoinRef} = join(#{updater => nh_ota_resumed, updates => manual}),
+    send_update(Agent, JoinRef, Update),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ok = nerves_hub_link:apply_update(Agent, Update),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    flush_events(),
+
+    ok = nerves_hub_link:apply_update(Agent, Update),
+    ?assertEqual({update_decision_ignored, armed}, next_event(1000)),
+    ?assertEqual({error, armed}, nerves_hub_link:request_update(Agent)),
+
+    nh_agent:stop(Agent).
+
+%% A `before_update' that does not return `ok' is an update that does not
+%% happen: the owner and NervesHub hear it failed, and the agent carries on.
+a_failing_before_update_fails_the_update_test() ->
+    {Agent, JoinRef} = join(#{before_update => fun() -> {error, busy} end}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertEqual({update_failed, {before_update, {error, busy}}}, next_event(1000)),
+    _Received = wait_for_event(<<"status_update">>, 1000),
+    Failed = wait_for_event(<<"status_update">>, 1000),
+    ?assertEqual(<<"before_update_failed">>, maps:get(<<"reason">>, Failed)),
+    ?assert(is_process_alive(Agent)),
+
+    nh_agent:stop(Agent).
+
+%% A download that starts again each resume does not queue a `started' each
+%% time: NervesHub hears the latest of each status.
+a_status_held_while_closed_is_kept_once_test() ->
+    {Agent, JoinRef} = join(#{keep_open_above => never, updater => nh_ota_restarted}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, wait_for_event(<<"status_update">>, 1000))),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    Statuses = statuses(),
+    ?assertEqual([<<"started">>, <<"completed">>], Statuses),
+
+    nh_agent:stop(Agent).
+
+%% The statuses sent until nothing is for a moment.
+statuses() ->
+    case next_sent(300) of
+        nothing_sent ->
+            [];
+        Frame ->
+            case json:decode(Frame) of
+                [_, _, _, <<"status_update">>, #{<<"status">> := Status}] -> [Status | statuses()];
+                _Other -> statuses()
+            end
+    end.
+
+%% With the socket closed for the download, what the download had to say goes
+%% once the device has joined again, in order.
+statuses_made_while_closed_go_after_the_next_join_test() ->
+    {Agent, JoinRef} = join(#{keep_open_above => never, updater => nh_ota_resumed}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, wait_for_event(<<"status_update">>, 1000))),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+
+    %% reopened once armed; joining sends what was held
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    ?assertEqual(
+        <<"completed">>, maps:get(<<"status">>, wait_for_event(<<"status_update">>, 1000))
+    ),
+
+    nh_agent:stop(Agent).
+
+%% Lost, not closed for the download, a connection keeps its backoff: the
+%% download ending does not open it early.
+a_connection_lost_during_the_download_keeps_its_backoff_test() ->
+    {Agent, JoinRef} = join(#{
+        keep_open_above => 60000, updater => nh_ota_resumed, reconnect_backoff => {1500, 1500}
+    }),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    wait_for_notice({update_started, '_'}, 1000),
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    receive
+        {opened, _, _} -> erlang:error(opened_before_the_backoff)
+    after 300 -> ok
+    end,
+
+    nh_agent:stop(Agent).
+
+%% A connection lost while the download runs has a reconnect waiting, with its
+%% backoff. The download ending leaves it to that reconnect, rather than open
+%% the socket at once and a second on top of it.
+a_connection_lost_during_the_download_is_opened_once_test() ->
+    {Agent, JoinRef} = join(#{
+        keep_open_above => 60000, updater => nh_ota_resumed, reconnect_backoff => {600, 600}
+    }),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    wait_for_notice({update_started, '_'}, 1000),
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    _ = next_opened(),
+    receive
+        {opened, _, _} -> erlang:error(opened_twice)
+    after 800 -> ok
+    end,
+
+    nh_agent:stop(Agent).
+
+wait_for_notice({Tag, '_'}, Timeout) ->
+    case next_event(Timeout) of
+        {Tag, _} -> ok;
+        no_event -> erlang:error({no_notice, Tag});
+        _Other -> wait_for_notice({Tag, '_'}, Timeout)
+    end;
+wait_for_notice(Notice, Timeout) ->
+    case next_event(Timeout) of
+        Notice -> ok;
+        no_event -> erlang:error({no_notice, Notice});
+        _Other -> wait_for_notice(Notice, Timeout)
+    end.
+
+flush_events() ->
+    case next_event(100) of
+        no_event -> ok;
+        _ -> flush_events()
+    end.
+
 %% `update_available => false' is NervesHub saying there is nothing to do.
 an_unavailable_update_starts_nothing_test() ->
     {Agent, JoinRef} = join(#{}),

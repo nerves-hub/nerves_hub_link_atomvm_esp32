@@ -137,9 +137,12 @@ The calling process receives `{nerves_hub, Event}`:
 | `{join_error, Reason}` | The server refused the join |
 | `{message, Event, Payload}` | A server message this library does not handle itself |
 | `{update_started, Pid}` | An update is downloading |
+| `{download_socket, open \| closed, Largest}` | With `keep_open_above`: whether the socket stays open for the download |
 | `{download_resumed, Offset}` | The download reconnected and asked for the rest from `Offset` |
 | `{update_ready, Slot}` | Written and armed; reboot when convenient |
 | `{update_failed, Reason}` | Refused, or the write failed |
+| `{update_ignored, armed}` | An offer while an update waits for the reboot |
+| `{update_decision_ignored, updating \| armed}` | `apply_update/2` while one downloads or waits for the reboot |
 | `{firmware_committed, Slot}` | The running update proved itself |
 | `{firmware_trial, Slot, Boot}` | Booted firmware that has not proved itself yet |
 | `{firmware_reverted, Slot}` | It did not; the device boots `Slot` next |
@@ -213,6 +216,9 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `ping_interval_ms` | 60000 | WebSocket pings; the IDF on its own sends them every 10 s |
 | `download_resume_after_ms` | 10000 | How long a download connection may stay quiet before it is resumed. See [updates](#updates) |
 | `download_resumes` | 3 | Download connections in a row that bring nothing before giving up |
+| `keep_open_above` | unset: open | Close the socket while an update downloads unless this many bytes are free in one block, or `never` to always close. See [updates](#updates) |
+| `before_update` | none | A function run before a download starts, to free memory |
+| `update_retry_backoff` | `{30000, 3600000}` | First and longest wait before joining again after a failed update, in ms |
 | `transport` | `websocket_client` | |
 
 ## Updates
@@ -229,6 +235,33 @@ the device running what it had.
 NervesHub hears how it goes as it goes: `received` when the update is accepted,
 `started` as each download connection begins, progress while it downloads,
 `completed` once it is armed, and `failed` with a reason if it is not.
+
+An ESP32 without PSRAM may have room for one TLS session, not two: with the
+socket open, the download's handshake can leave too little heap for the next
+record on either connection, and the device aborts. `keep_open_above => Bytes`
+closes the socket while an update downloads, unless the largest free block of
+heap is at least `Bytes` as the download starts, and reopens it afterwards;
+`never` always closes it. The owner hears `{download_socket, open | closed,
+LargestFreeBlock}`, and what NervesHub would have heard while the socket was
+closed is sent, in order, once the device has joined again: the latest of each
+status, so a download resumed many times is one `started`. Only a socket closed
+for the download opens again at once; one lost during it keeps its reconnect
+backoff. `before_update` runs before any of this, so the application can free
+memory of its own first; if it returns anything but `ok`, or raises, the update
+fails (`{update_failed, {before_update, Result}}`) and nothing is downloaded.
+
+NervesHub offers an update again only when the device joins. After a failed
+update the device joins again, after `update_retry_backoff`: 30 s, doubling
+with each failure in a row up to an hour, back to the start once an update
+succeeds. A socket kept open for the download reconnects; one closed for it
+opens again then, and NervesHub hears of the failure on that join.
+
+An update armed and waiting for the reboot counts as busy: NervesHub offers it
+again on the next join, and downloading it would write over a slot the device
+needs. Until the reboot, an offer is ignored and the owner hears
+`{update_ignored, armed}`; `apply_update/2` is answered with
+`{update_decision_ignored, armed}`, and `request_update/1` with
+`{error, armed}`.
 
 A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
 short is dropped, and the rest is asked for from the last byte received with a

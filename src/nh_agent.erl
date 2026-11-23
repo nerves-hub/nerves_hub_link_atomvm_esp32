@@ -62,6 +62,31 @@
 %% the application for its alarms every `alarms_interval_ms' (30 s by default)
 %% and sends what changed; see `nh_ext_alarms'. It keeps asking while offline,
 %% so an alarm raised then keeps the time it was raised.
+%%
+%% == Updates ==
+%%
+%% An ESP32 without PSRAM may have room for one TLS session, not two: with the
+%% socket open, the download's handshake can leave too little heap for the
+%% next record on either connection. `keep_open_above => Bytes' closes the
+%% socket while an update downloads, unless the largest free block of heap is
+%% at least `Bytes' as the download starts -- room for both sessions -- and
+%% reopens it afterwards. `never' closes it whatever the heap. Without the
+%% option the socket stays open, and so does it on a platform that does not
+%% report its heap (not an ESP32).
+%%
+%% With the option set, the owner hears `{download_socket, open | closed,
+%% LargestFreeBlock}' as the download starts. What the download had to tell
+%% NervesHub while the socket was closed -- that it started, completed or
+%% failed -- goes once the device has joined again.
+%%
+%% `before_update => Fun' is called before any of this, so the application can
+%% free memory first (its own TLS connections, say); it hears `update_failed'
+%% if the update does not happen, including when `Fun' does not return `ok'.
+%%
+%% An update armed for the next boot counts as busy until then: offers are
+%% ignored with `{update_ignored, armed}' to the owner, `apply_update/2' with
+%% `{update_decision_ignored, armed}', and `request_update/1' is answered
+%% `{error, armed}'.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_agent).
@@ -71,6 +96,7 @@
 %% Exported so a supervisor or a test can run the loop directly.
 -export([init/2, loop/1]).
 -export([seal/1]).
+-export([keep_open/2]).
 
 %% What this agent tells NervesHub it speaks. 2.4.0 is the version that brings
 %% device-managed updates; below 2.1.0 NervesHub types support scripts into the
@@ -122,6 +148,19 @@
 
 -define(DEFAULT_ALARMS_INTERVAL_MS, 30000).
 
+%% How long to wait for the closed socket's transport to be gone before a
+%% download starts, and how long to then idle so its memory comes back. See
+%% close_for_download/1.
+-define(GONE_TIMEOUT_MS, 5000).
+-define(RECLAIM_MS, 200).
+
+%% How long after a failed update the device joins again, so that NervesHub
+%% offers it again: doubling from the first to the second with each failure in
+%% a row, until an update succeeds. A failure that repeats at once (a 404, a
+%% bad signature, an archive too big for the slot) would otherwise be offered,
+%% fail and be offered again every few seconds, each round a TLS handshake.
+-define(DEFAULT_UPDATE_RETRY_BACKOFF, {30000, 3600000}).
+
 -type config() :: #{
     url => binary() | string(),
     host => binary() | string(),
@@ -144,7 +183,10 @@
     alarms_interval_ms => pos_integer(),
     download_idle_ms => pos_integer(),
     download_resume_after_ms => pos_integer(),
-    download_resumes => pos_integer()
+    download_resumes => pos_integer(),
+    keep_open_above => non_neg_integer() | never,
+    before_update => fun(() -> ok),
+    update_retry_backoff => {pos_integer(), pos_integer()}
 }.
 
 %% A pair, or a fun that returns it: see Credentials in the module doc.
@@ -230,6 +272,8 @@ init(Config, Owner) ->
         reboot => maps:get(reboot, Config, auto),
         console => nh_console:new(maps:get(console_commands, Config, [])),
         extensions => Extensions,
+        %% Status updates made while the socket was closed for a download.
+        deferred => [],
         log_buffer => nh_log_buffer:new(maps:get(log_buffer, Config, ?DEFAULT_LOG_BUFFER)),
         ext_refs => [],
         heartbeat_ms => maps:get(heartbeat_ms, Config, ?DEFAULT_HEARTBEAT_MS),
@@ -340,23 +384,29 @@ socket_event({error, Reason}, State) ->
 %% The join is gone with the socket, but the channel is not rebuilt: that would
 %% restart reference numbering and drop the join parameters, so a reconnected
 %% device would report no firmware at all.
-lost(Why, #{transport := Transport, handle := Handle} = State0) ->
-    notify(State0, Why),
+lost(Why, State) ->
+    notify(State, Why),
+    schedule_reconnect(disconnect(State)).
+
+%% Closed, whether it was lost or closed on purpose for a download.
+disconnect(#{handle := undefined} = State) ->
+    State;
+disconnect(#{transport := Transport, handle := Handle} = State0) ->
     _ = Transport:close(Handle),
     State1 = fail_requests(disconnected, State0),
     State2 = lists:foldl(
         fun cancel_timer/2,
         State1,
-        [heartbeat, connect_timeout, extensions_fallback, log_flush]
+        [heartbeat, connect_timeout, extensions_fallback, log_flush, rejoin]
     ),
-    schedule_reconnect(State2#{
+    State2#{
         handle => undefined,
         socket_up => false,
         channel => nh_channel:disconnected(maps:get(channel, State2)),
         %% Nothing is attached without a channel to be attached on. Log lines
         %% are held until the next join says where they can go.
         extensions => nh_extensions:disconnected(maps:get(extensions, State2))
-    }).
+    }.
 
 schedule_reconnect(#{config := Config, reconnect_attempt := Attempt} = State) ->
     {Min, Max} = maps:get(reconnect_backoff, Config, ?DEFAULT_RECONNECT_BACKOFF),
@@ -394,6 +444,12 @@ fire(update_idle, State) ->
 fire(poll_alarms, State) ->
     {Extensions, Actions} = nh_extensions:poll_alarms(maps:get(extensions, State)),
     schedule_alarms(run_extension_actions(Actions, State#{extensions => Extensions}));
+%% Closed as for a download, so the transport is gone and its memory back
+%% before the new connection asks for its own.
+fire(rejoin, State) ->
+    reopen(close_for_download(State));
+fire(reopen, State) ->
+    reopen(State);
 fire({request, Kind}, State) ->
     reply_request(Kind, {error, timeout}, State);
 fire({script, Ref}, State) ->
@@ -460,7 +516,7 @@ run_action({event, Event}, State) ->
 %% reported by name.
 handle_event({joined, <<"device">>, Response}, State) ->
     notify(State, {joined, Response}),
-    State1 = validate_pending(State),
+    State1 = send_deferred(validate_pending(State)),
     State2 = push_event(
         <<"report_network_interface">>, #{<<"interface">> => network_interface(State1)}, State1
     ),
@@ -648,23 +704,40 @@ ota_opts(#{esp := Esp}) -> #{esp => Esp}.
 update_offered(Payload, State) ->
     Available = maps:get(<<"update_available">>, Payload, false) =:= true,
     Requested = maps:is_key(request_update, maps:get(requests, State)),
-    Busy = maps:is_key(update, State),
+    %% Armed counts as busy until the reboot. A socket closed for the download
+    %% reopens once the update is written, and NervesHub, still seeing the old
+    %% firmware, offers it again. Downloading that would write into the other
+    %% slot -- which by then is the previous firmware, the one a failed update
+    %% needs to go back to.
+    Busy = maps:is_key(update, State) orelse maps:is_key(armed, State),
 
     case {Available, Busy, Requested orelse maps:get(updates, State, auto) =:= auto} of
         {false, _, _} ->
             State;
+        {true, true, _} when is_map_key(armed, State) ->
+            %% The owner hears it: a reboot that was put off, or that failed,
+            %% is what stands between the device and this offer, whichever
+            %% firmware it is.
+            notify(State, {update_ignored, armed}),
+            reply_request(request_update, {error, armed}, State);
         {true, true, _} ->
             %% One at a time. A second `update' while a download is in flight
             %% is the server repeating itself, not a new job.
             State;
         {true, false, true} ->
-            reply_request(request_update, ok, start_update(Payload, State));
+            %% Answered first: the socket may close for the download.
+            start_update(Payload, reply_request(request_update, ok, State));
         {true, false, false} ->
             State
     end.
 
 update_decision(_Decision, #{update := _Pid} = State) ->
     notify(State, {update_decision_ignored, updating}),
+    State;
+%% Armed, the slot a download would write is the one the device boots next, or
+%% the one it runs: the reboot comes first.
+update_decision({apply, _Payload}, #{armed := _Slot} = State) ->
+    notify(State, {update_decision_ignored, armed}),
     State;
 update_decision({apply, Payload}, State) ->
     start_update(Payload, State);
@@ -675,12 +748,110 @@ update_decision({reschedule, DelayMs, Reason}, State) ->
 
 start_update(Payload, State0) ->
     State = status_update(<<"received">>, #{}, State0),
+    case before_update(State) of
+        ok -> download(Payload, State);
+        {error, Reason} -> update_failed(Reason, <<"before_update_failed">>, State)
+    end.
+
+download(Payload, State) ->
+    State1 = make_room_for_download(State),
     %% `updater' is for the tests only, which put a fake downloader in nh_ota's
     %% place; it is not part of the documented config.
-    Updater = maps:get(updater, maps:get(config, State), nh_ota),
-    Pid = Updater:start_update(Payload, self(), download_opts(State)),
-    notify(State, {update_started, Pid}),
-    download_alive(State#{update => Pid}).
+    Updater = maps:get(updater, maps:get(config, State1), nh_ota),
+    Pid = Updater:start_update(Payload, self(), download_opts(State1)),
+    notify(State1, {update_started, Pid}),
+    download_alive(State1#{update => Pid}).
+
+%% The application's chance to free memory for the download (stop its own TLS
+%% connections, say) before the heap is measured and the download starts. It
+%% hears `update_failed' if the update does not happen, to start them again.
+%% One that does not return `ok' is the update not happening: the owner hears
+%% `{update_failed, {before_update, Result}}', and NervesHub that it failed.
+before_update(#{config := #{before_update := Fun}}) ->
+    try Fun() of
+        ok -> ok;
+        Other -> {error, {before_update, Other}}
+    catch
+        Class:Reason -> {error, {before_update, {Class, Reason}}}
+    end;
+before_update(_State) ->
+    ok.
+
+%% The owner hears which it was, and the largest block it was decided on: with
+%% the socket closed nothing of the download reaches NervesHub, so that is the
+%% application's to keep until it is back.
+make_room_for_download(#{config := #{keep_open_above := Min}} = State) ->
+    Largest = largest_free_block(),
+    case keep_open(Min, Largest) of
+        true ->
+            notify(State, {download_socket, open, Largest}),
+            State;
+        false ->
+            notify(State, {download_socket, closed, Largest}),
+            close_for_download(State)
+    end;
+make_room_for_download(State) ->
+    State.
+
+%% @private Exported for tests: a host has no ESP32 heap to measure.
+keep_open(never, _Largest) -> false;
+keep_open(_Min, undefined) -> true;
+keep_open(Min, Largest) -> Largest >= Min.
+
+largest_free_block() ->
+    try
+        erlang:system_info(esp32_largest_free_block)
+    catch
+        _:_ -> undefined
+    end.
+
+%% The socket is closed so the download can have its memory, and on an ESP32
+%% without PSRAM it needs all of it: the download's TLS handshake takes nearly
+%% every free byte. But closing returns before that memory is back. The port is
+%% destroyed a moment later, and the port telling this process it has gone
+%% needs a few bytes of its own -- which, once the handshake has started, are
+%% not there: "Cannot handle out of memory", abort, reboot, and the server
+%% offers the update again. Seen 13 and 19 times in a row before one got
+%% through.
+%%
+%% So: wait for the transport to be gone (its 'DOWN'), then sleep briefly.
+%% Sleeping idles the scheduler, which is what lets FreeRTOS's idle task free
+%% the stack of the task the WebSocket client ran on; a task that deletes
+%% itself is only reclaimed there. A handle that is neither a port nor a pid
+%% (a test's) has nothing to wait for. Closed on purpose, so nothing
+%% reconnects: `reopen/1' does, once the download is over.
+close_for_download(#{handle := undefined} = State) ->
+    State;
+close_for_download(#{handle := Handle} = State) ->
+    Monitor = monitor_handle(Handle),
+    State1 = disconnect(State),
+    await_gone(Monitor),
+    timer:sleep(?RECLAIM_MS),
+    State1#{closed_for_download => true}.
+
+monitor_handle(Handle) when is_port(Handle) -> erlang:monitor(port, Handle);
+monitor_handle(Handle) when is_pid(Handle) -> erlang:monitor(process, Handle);
+monitor_handle(_Handle) -> undefined.
+
+await_gone(undefined) ->
+    ok;
+await_gone(Monitor) ->
+    receive
+        {'DOWN', Monitor, _Type, _Object, _Reason} -> ok
+    after ?GONE_TIMEOUT_MS ->
+        erlang:demonitor(Monitor, [flush]),
+        ok
+    end.
+
+%% Only a socket closed for the download opens again at once. Joining again is
+%% left to `connected', as on any other connection, and one that does not open
+%% is retried like any lost connection. A connection lost during the download,
+%% not closed for it, keeps the reconnect and backoff it already has.
+reopen(#{closed_for_download := true, handle := undefined} = State) ->
+    State1 = maps:remove(closed_for_download, State),
+    reconnect(cancel_timer(reconnect, State1#{reconnect_attempt => 0}));
+reopen(State) ->
+    maps:remove(closed_for_download, State).
 
 %% `download_resume_after_ms' and `download_resumes' reach the downloader as
 %% its `resume_after_ms' and `resumes': a device on a link whose handshake
@@ -710,6 +881,10 @@ updater(started, State) ->
             <<"started">>, #{<<"downloader_network_interface">> => network_interface(State)}, State
         )
     );
+%% Nowhere to send progress while the socket is closed for the download, and
+%% no point keeping it for later.
+updater({progress, _Percent}, #{handle := undefined} = State) ->
+    download_alive(State);
 updater({progress, Percent}, State) ->
     download_alive(
         push_event(
@@ -727,8 +902,8 @@ updater({ok, Slot}, State) ->
     %% call: it may have work to finish first, and a library that restarts a
     %% device on its own is a library that surprises someone.
     notify(State, {update_ready, Slot}),
-    State1 = status_update(<<"completed">>, #{}, State),
-    cancel_timer(update_idle, maps:remove(update, State1));
+    State1 = status_update(<<"completed">>, #{}, State#{failed_updates => 0}),
+    reopen(cancel_timer(update_idle, maps:remove(update, State1#{armed => Slot})));
 updater({error, Reason}, State) ->
     update_failed(Reason, describe(Reason), State).
 
@@ -738,13 +913,61 @@ update_stalled(#{update := Pid} = State) ->
 update_stalled(State) ->
     State.
 
+%% Reported now if the socket stayed open and joined; otherwise on the next join.
+%%
+%% NervesHub offers an update again only when the device joins again. With
+%% the socket kept open, nothing would ever ask again, so it reconnects; with
+%% it closed for the download, it opens again. Either waits
+%% `update_retry_backoff', longer with each failure in a row.
 update_failed(Reason, Described, State) ->
     notify(State, {update_failed, Reason}),
     State1 = status_update(<<"failed">>, #{<<"reason">> => Described}, State),
-    cancel_timer(update_idle, maps:remove(update, State1)).
+    State2 = cancel_timer(update_idle, maps:remove(update, State1)),
+    Failures = maps:get(failed_updates, State2, 0),
+    Delay = update_retry_delay(Failures, State2),
+    State3 = State2#{failed_updates => Failures + 1},
+    case {maps:get(handle, State3), maps:get(closed_for_download, State3, false)} of
+        %% Closed for the download: it opens again after the backoff, and the
+        %% failure goes to NervesHub on that join.
+        {undefined, true} -> set_timer(reopen, Delay, State3);
+        %% Lost during the download: its own reconnect is waiting.
+        {undefined, false} -> State3;
+        {_Open, _} -> set_timer(rejoin, Delay, State3)
+    end.
 
+update_retry_delay(Failures, #{config := Config}) ->
+    {Min, Max} = maps:get(update_retry_backoff, Config, ?DEFAULT_UPDATE_RETRY_BACKOFF),
+    nh_backoff:delay(Failures, Min, Max).
+
+%% Made while the socket is closed for a download, a status update waits for
+%% the next join; NervesHub would not hear it otherwise.
 status_update(Status, Extra, State) ->
-    push_event(<<"status_update">>, Extra#{<<"status">> => Status}, State).
+    Payload = Extra#{<<"status">> => Status},
+    case
+        maps:get(handle, State) =/= undefined andalso nh_channel:joined(maps:get(channel, State))
+    of
+        true ->
+            push_event(<<"status_update">>, Payload, State);
+        %% The latest of each: a download that resumes says `started' again
+        %% each time, and NervesHub needs only where it got to.
+        false ->
+            State#{
+                deferred => [P || P <- maps:get(deferred, State), not same_status(P, Status)] ++
+                    [Payload]
+            }
+    end.
+
+same_status(#{<<"status">> := Status}, Status) -> true;
+same_status(_Payload, _Status) -> false.
+
+send_deferred(#{deferred := []} = State) ->
+    State;
+send_deferred(#{deferred := Deferred} = State) ->
+    lists:foldl(
+        fun(Payload, Acc) -> push_event(<<"status_update">>, Payload, Acc) end,
+        State#{deferred => []},
+        Deferred
+    ).
 
 %% A downloader that exits normally has already sent its result. One that dies
 %% any other way has not, and nothing else would ever say so.
@@ -783,6 +1006,9 @@ call(Request, From, Tag, State) ->
             State;
         Kind =:= request_update, is_map_key(update, State) ->
             reply(From, Tag, {error, updating}),
+            State;
+        Kind =:= request_update, is_map_key(armed, State) ->
+            reply(From, Tag, {error, armed}),
             State;
         true ->
             send_request(Request, Kind, From, Tag, State)
