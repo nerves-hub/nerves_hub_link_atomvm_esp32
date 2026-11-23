@@ -108,6 +108,10 @@
 %% has no receive timeout of its own, so without this it would wait forever.
 -define(DEFAULT_DOWNLOAD_IDLE_MS, 120000).
 -define(DEFAULT_LOG_FLUSH_MS, 10000).
+%% After a batch sent at once, the next urgent lines wait this long and go
+%% together: NervesHub takes 5 logging messages a second (bursts of 10), and a
+%% message per error line in a crash loop would lose most of them.
+-define(URGENT_LOG_GAP_MS, 250).
 -define(DEFAULT_LOG_BUFFER, 100).
 -define(DEFAULT_NETWORK_INTERFACE, <<"wlan0">>).
 -define(DEFAULT_TRIAL, #{boot_attempts => 3, join_timeout_ms => 300000}).
@@ -378,6 +382,8 @@ fire(extensions_fallback, State) ->
     join_extensions(undefined, State);
 fire(log_flush, State) ->
     flush_logs(State);
+fire(urgent_log_gap, State) ->
+    urgent_flush(State);
 fire(trial_deadline, State) ->
     trial_expired(State);
 fire(update_idle, State) ->
@@ -666,7 +672,10 @@ update_decision({reschedule, DelayMs, Reason}, State) ->
 
 start_update(Payload, State0) ->
     State = status_update(<<"received">>, #{}, State0),
-    Pid = nh_ota:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
+    %% `updater' is for the tests only, which put a fake downloader in nh_ota's
+    %% place; it is not part of the documented config.
+    Updater = maps:get(updater, maps:get(config, State), nh_ota),
+    Pid = Updater:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
     notify(State, {update_started, Pid}),
     download_alive(State#{update => Pid}).
 
@@ -734,6 +743,12 @@ process_down(_Pid, _Reason, State) ->
 call(update_mode, From, Tag, State) ->
     reply(From, Tag, update_mode_reply(maps:get(update_mode, State))),
     State;
+%% Before the application restarts the device on purpose: what it logged on the
+%% way down is the line that says why.
+call(flush_logs, From, Tag, State) ->
+    State1 = flush_all_logs(State),
+    reply(From, Tag, ok),
+    State1;
 call(Request, From, Tag, State) ->
     Kind = request_kind(Request),
     Requests = maps:get(requests, State),
@@ -976,7 +991,7 @@ extension_out(<<"logging:send">>, Line, State) ->
                     push_extension(nh_ext_logs:event(), Line, State);
                 batched ->
                     Buffer = nh_log_buffer:add(Line, maps:get(log_buffer, State)),
-                    maybe_flush_logs(State#{log_buffer => Buffer})
+                    maybe_flush_logs(Line, State#{log_buffer => Buffer})
             end
     end;
 extension_out(Event, Payload, State) ->
@@ -995,11 +1010,48 @@ logging_mode(State) ->
     end.
 
 %% A full batch goes now; anything less waits for the flush timer, so a chatty
-%% moment costs one message rather than one per line.
-maybe_flush_logs(State) ->
-    case nh_log_buffer:size(maps:get(log_buffer, State)) >= nh_ext_logs:max_batch() of
-        true -> flush_logs(State);
-        false -> arm_log_flush(State)
+%% moment costs one message rather than one per line. Except when the next
+%% thing may be the device going down, taking the batch with it: an error, or a
+%% download, which is when a board without PSRAM runs out of memory. Those go
+%% soon rather than at once: the first now, and what follows within
+%% `?URGENT_LOG_GAP_MS' together when the gap ends, so a burst of errors is a
+%% few messages a second rather than one per line.
+maybe_flush_logs(Line, State) ->
+    Full = nh_log_buffer:size(maps:get(log_buffer, State)) >= nh_ext_logs:max_batch(),
+    Urgent = urgent(Line) orelse is_map_key(update, State),
+    case {Full, Urgent} of
+        {true, _} -> flush_logs(State);
+        {false, true} -> urgent_flush(State);
+        {false, false} -> arm_log_flush(State)
+    end.
+
+%% Now, unless an urgent batch went less than a gap ago: then the gap's timer
+%% sends it. Nothing waiting when the gap ends leaves the next urgent line free
+%% to go at once.
+urgent_flush(#{timers := Timers} = State) ->
+    Waiting = nh_log_buffer:size(maps:get(log_buffer, State)) > 0,
+    case is_map_key(urgent_log_gap, Timers) of
+        true ->
+            State;
+        false when Waiting ->
+            set_timer(urgent_log_gap, ?URGENT_LOG_GAP_MS, flush_logs(State));
+        false ->
+            State
+    end.
+
+urgent(#{<<"level">> := Level}) ->
+    lists:member(Level, [<<"error">>, <<"critical">>, <<"alert">>, <<"emergency">>]);
+urgent(_Line) ->
+    false.
+
+%% Everything waiting, not just one batch.
+flush_all_logs(State) ->
+    Before = nh_log_buffer:size(maps:get(log_buffer, State)),
+    State1 = flush_logs(State),
+    case nh_log_buffer:size(maps:get(log_buffer, State1)) of
+        0 -> State1;
+        Before -> State1;
+        _Fewer -> flush_all_logs(State1)
     end.
 
 arm_log_flush(#{timers := Timers, config := Config} = State) ->
@@ -1114,7 +1166,8 @@ off_heap(Fun) ->
 %% once the frame is handed to the socket, not once it leaves, and `esp:restart/0'
 %% is immediate -- so without a pause the platform never learns why the device
 %% vanished. The same gap swallowed the update messages on the ESP-IDF agent.
-reboot(State) ->
+reboot(State0) ->
+    State = flush_all_logs(State0),
     _ = timer:sleep(?REBOOT_GRACE_MS),
     _ =
         try

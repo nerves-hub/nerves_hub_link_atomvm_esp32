@@ -673,6 +673,98 @@ a_batch_stops_at_its_byte_limit_test() ->
 
     nh_agent:stop(Agent).
 
+%% An error may be the last thing a device says: it does not wait for the timer.
+an_error_line_goes_at_once_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 60000}, [<<"logging">>], advert()
+    ),
+
+    ok = nerves_hub_link:send_log(Agent, <<"info">>, <<"before">>),
+    ok = nerves_hub_link:send_log(Agent, <<"error">>, <<"boom">>),
+    #{<<"lines">> := Lines} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual([<<"before">>, <<"boom">>], [maps:get(<<"message">>, L) || L <- Lines]),
+
+    nh_agent:stop(Agent).
+
+%% A burst of errors is not a message per line: NervesHub takes 5 a second and
+%% would drop the rest. The first goes at once, the others together a moment
+%% later.
+a_burst_of_errors_goes_in_two_messages_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 60000}, [<<"logging">>], advert()
+    ),
+
+    [
+        ok = nerves_hub_link:send_log(Agent, <<"error">>, integer_to_binary(N))
+     || N <- lists:seq(1, 20)
+    ],
+    #{<<"lines">> := First} = wait_for_event(<<"logging:send">>, 1000),
+    #{<<"lines">> := Second} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual(20, length(First) + length(Second)),
+    ?assertEqual(0, count_events(<<"logging:send">>, 500)),
+
+    nh_agent:stop(Agent).
+
+%% How many `Event's are sent before nothing is for `Timeout' ms.
+count_events(Event, Timeout) ->
+    case next_sent(Timeout) of
+        nothing_sent ->
+            0;
+        Frame ->
+            case json:decode(Frame) of
+                [_, _, _, Event, _] -> 1 + count_events(Event, Timeout);
+                _Other -> count_events(Event, Timeout)
+            end
+    end.
+
+%% A restart on purpose asks first, so the lines that say why are not lost.
+flush_logs_sends_what_is_waiting_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 60000}, [<<"logging">>], advert()
+    ),
+
+    ok = nerves_hub_link:send_log(Agent, <<"info">>, <<"restarting: test">>),
+    ?assertEqual(ok, nerves_hub_link:flush_logs(Agent, 1000)),
+    #{<<"lines">> := [Line]} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual(<<"restarting: test">>, maps:get(<<"message">>, Line)),
+    ?assertEqual({error, no_agent}, nerves_hub_link:flush_logs(no_such_agent, 100)),
+
+    nh_agent:stop(Agent).
+
+%% A download is when a board without PSRAM runs out of memory: what it logs
+%% then goes at once.
+lines_logged_during_a_download_go_at_once_test() ->
+    {Agent, Ref, _} = join_with_extensions(
+        #{
+            extensions => [logging],
+            log_flush_ms => 60000,
+            updater => nh_ota_waiting
+        },
+        [<<"logging">>],
+        advert()
+    ),
+    Frame = json:encode([
+        Ref,
+        null,
+        <<"device">>,
+        <<"update">>,
+        #{
+            <<"update_available">> => true,
+            <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+            <<"size">> => 1024,
+            <<"checksum">> => <<"abc">>
+        }
+    ]),
+    Agent ! {websocket, fake_handle, {text, iolist_to_binary(Frame)}},
+    Received = wait_for_event(<<"status_update">>, 1000),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, Received)),
+
+    ok = nerves_hub_link:send_log(Agent, <<"info">>, <<"downloading">>),
+    #{<<"lines">> := [Line]} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual(<<"downloading">>, maps:get(<<"message">>, Line)),
+
+    nh_agent:stop(Agent).
+
 %% ------------------------------------------------------------------ actions
 
 send_device(Agent, JoinRef, Event) ->
