@@ -144,7 +144,10 @@
 %% process and everything it starts afterwards print is forwarded as well as
 %% shown on the console. The text arrives unstructured, at one level, timed on
 %% arrival -- there is no level or module in an `io:format' call to carry over.
-%% ESP-IDF's own `I (1234) wifi: ...' lines are written from C and are not
+%% With `register => Name', the capture sends to that name and is registered
+%% itself as `nh_io_capture_Name': an agent started again under the name reuses
+%% it rather than leaving a capture behind per restart, and agents under other
+%% names each have their own. ESP-IDF's own `I (1234) wifi: ...' lines are written from C and are not
 %% caught by anything here.
 %%
 %% One thing to change when turning it on: `logger' runs its handlers in the
@@ -479,13 +482,40 @@ with_agent_config(Config, Start) ->
 capture_io(Config, Agent) ->
     case maps:get(capture_io, Config, false) of
         false -> ok;
-        true -> capture(#{agent => Agent});
-        Options when is_map(Options) -> capture(Options#{agent => Agent})
+        true -> capture(#{}, Config, Agent);
+        Options when is_map(Options) -> capture(Options, Config, Agent)
     end.
 
-capture(Options) ->
-    {ok, Capture} = nh_io_capture:start(Options),
+%% A registered agent is captured by its name, through one capture per name. An
+%% agent started again under the same name finds it there, so the processes
+%% that inherited it keep reaching the new agent, and no capture is left behind
+%% sending to a dead one. An agent under another name has a capture of its own,
+%% with its own options.
+capture(Options, #{register := Name}, _Agent) ->
+    nh_io_capture:attach(named_capture(capture_name(Name), Options#{agent => Name}));
+capture(Options, _Config, Agent) ->
+    {ok, Capture} = nh_io_capture:start(Options#{agent => Agent}),
     nh_io_capture:attach(Capture).
+
+capture_name(Name) ->
+    list_to_atom("nh_io_capture_" ++ atom_to_list(Name)).
+
+%% Two agents of one name starting at the same moment both find no capture;
+%% the one whose register fails uses the winner's and stops its own.
+named_capture(CaptureName, Options) ->
+    case whereis(CaptureName) of
+        undefined ->
+            {ok, Pid} = nh_io_capture:start(Options),
+            try register(CaptureName, Pid) of
+                true -> Pid
+            catch
+                error:badarg ->
+                    ok = nh_io_capture:stop(Pid),
+                    named_capture(CaptureName, Options)
+            end;
+        Pid ->
+            Pid
+    end.
 
 validate(Config) ->
     case missing_keys(Config) of

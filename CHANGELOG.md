@@ -40,6 +40,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSON-encoded in the agent, which on AtomVM costs the process many times the
   output's size in heap: a 2 KB answer with quotes in it took more than an
   ESP32 without PSRAM had in one block, and the device panicked.
+### Fixed
+
+- `capture_io` with `register => Name` captures by the name, through one
+  capture per name registered as `nh_io_capture_Name`; agents under other names
+  have their own. An agent started again under the name used to
+  get a new capture each time, and the old one stayed alive sending to the dead
+  agent, along with every process that had inherited it.
 
 ## [0.2.0] - 2026-09-24
 
