@@ -203,13 +203,46 @@ a_restarted_registered_agent_keeps_its_capture_test() ->
     receive
         {started, Leader, Again, Agent} ->
             ?assertEqual(Leader, Again),
-            ?assertEqual(Leader, whereis(nh_io_capture)),
+            ?assertEqual(Leader, whereis(list_to_atom("nh_io_capture_" ++ atom_to_list(Name)))),
             ok = nerves_hub_link:stop(Agent),
             ok = nh_io_capture:stop(Leader)
     after 2000 ->
         exit(Starter, kill),
         erlang:error(no_restart)
     end.
+
+%% Agents under two names have a capture each: the second does not send its
+%% output to the first, and keeps its own options.
+agents_under_two_names_have_a_capture_each_test() ->
+    setup(),
+    Test = self(),
+    Start = fun(Echo) ->
+        Name = list_to_atom("nh_cap_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        spawn(fun() ->
+            {ok, Agent} = nerves_hub_link:start(
+                config(#{firmware => none, register => Name, capture_io => #{echo => Echo}})
+            ),
+            Test ! {started, self(), Name, group_leader(), Agent}
+        end)
+    end,
+    Started = [
+        receive
+            {started, Pid, Name, Leader, Agent} -> {Name, Leader, Agent}
+        after 2000 -> erlang:error(no_start)
+        end
+     || Pid <- [Start(false), Start(true)]
+    ],
+    [{Name1, Leader1, _}, {Name2, Leader2, _}] = Started,
+    ?assertNotEqual(Leader1, Leader2),
+    ?assertEqual(Leader1, whereis(list_to_atom("nh_io_capture_" ++ atom_to_list(Name1)))),
+    ?assertEqual(Leader2, whereis(list_to_atom("nh_io_capture_" ++ atom_to_list(Name2)))),
+    [
+        begin
+            ok = nerves_hub_link:stop(Agent),
+            ok = nh_io_capture:stop(Leader)
+        end
+     || {_, Leader, Agent} <- Started
+    ].
 
 explicit_none_is_allowed_test() ->
     setup(),

@@ -42,8 +42,9 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ESP32 without PSRAM had in one block, and the device panicked.
 ### Fixed
 
-- `capture_io` with `register` captures by the name, through one capture
-  registered as `nh_io_capture`. An agent started again under the name used to
+- `capture_io` with `register => Name` captures by the name, through one
+  capture per name registered as `nh_io_capture_Name`; agents under other names
+  have their own. An agent started again under the name used to
   get a new capture each time, and the old one stayed alive sending to the dead
   agent, along with every process that had inherited it.
 
