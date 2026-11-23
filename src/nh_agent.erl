@@ -379,6 +379,13 @@ run_action({send, Frame}, State) ->
                     State;
                 {error, Reason} ->
                     notify(State, {send_failed, Reason}),
+                    State;
+                %% atomvm_websocket_client's port answered a bare
+                %% `not_connected' (or `send_failed') rather than the
+                %% `{error, _}' it documents, before nerves-hub/
+                %% atomvm_websocket_client#3.
+                Reason ->
+                    notify(State, {send_failed, Reason}),
                     State
             end
     end;
