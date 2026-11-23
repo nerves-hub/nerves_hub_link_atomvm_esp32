@@ -48,6 +48,7 @@
 %% {join_error, Reason}
 %% {message, Event, Payload}    %% "update" and friends
 %% {update_started, Pid}
+%% {download_resumed, Offset}  %% reconnected, asking from this byte
 %% {update_ready, Slot}         %% written and armed; reboot when ready
 %% {update_failed, Reason}
 %% {firmware_committed, Slot}   %% the running update proved itself

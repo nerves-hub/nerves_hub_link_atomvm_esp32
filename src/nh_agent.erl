@@ -141,7 +141,10 @@
     log_flush_ms => pos_integer(),
     log_buffer => pos_integer(),
     ping_interval_ms => pos_integer(),
-    alarms_interval_ms => pos_integer()
+    alarms_interval_ms => pos_integer(),
+    download_idle_ms => pos_integer(),
+    download_resume_after_ms => pos_integer(),
+    download_resumes => pos_integer()
 }.
 
 %% A pair, or a fun that returns it: see Credentials in the module doc.
@@ -675,9 +678,22 @@ start_update(Payload, State0) ->
     %% `updater' is for the tests only, which put a fake downloader in nh_ota's
     %% place; it is not part of the documented config.
     Updater = maps:get(updater, maps:get(config, State), nh_ota),
-    Pid = Updater:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
+    Pid = Updater:start_update(Payload, self(), download_opts(State)),
     notify(State, {update_started, Pid}),
     download_alive(State#{update => Pid}).
+
+%% `download_resume_after_ms' and `download_resumes' reach the downloader as
+%% its `resume_after_ms' and `resumes': a device on a link whose handshake
+%% often takes longer than the 10 s default raises them.
+download_opts(#{config := Config} = State) ->
+    Passed = [
+        {resume_after_ms, download_resume_after_ms},
+        {resumes, download_resumes}
+    ],
+    maps:from_list(
+        [{keys, maps:get(firmware_keys, State, [])}] ++
+            [{Opt, maps:get(Key, Config)} || {Opt, Key} <- Passed, is_map_key(Key, Config)]
+    ).
 
 %% Everything the downloader says is a sign it is still getting somewhere.
 download_alive(#{config := Config} = State) ->
@@ -702,6 +718,10 @@ updater({progress, Percent}, State) ->
             State
         )
     );
+%% The download reconnected and asked for the rest: a sign of life.
+updater({resumed, Offset}, State) ->
+    notify(State, {download_resumed, Offset}),
+    download_alive(State);
 updater({ok, Slot}, State) ->
     %% Written and armed, not yet running. Rebooting is the application's
     %% call: it may have work to finish first, and a library that restarts a
