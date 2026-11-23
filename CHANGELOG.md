@@ -34,6 +34,21 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   callback that fails leaves what was raised as it was.
 - `alarms => Fun` alone puts the application's alarms on the health report,
   which sent `#{}` before.
+- `keep_open_above` closes the socket while an update downloads, unless the
+  largest free block of heap is at least that many bytes (`never`: always), and
+  reopens it afterwards. An ESP32 without PSRAM has room for one TLS session,
+  not two: with the socket open an update took 13 to 19 attempts, each ending
+  in "Cannot handle out of memory". Closing waits for the transport to be gone
+  and its memory back. Status updates made while the socket is closed are sent
+  once the device has joined again. Without the option nothing changes.
+- After a failed update the device joins again, so that NervesHub offers it
+  again: before, a socket that stayed open never asked again, and the device
+  kept its old firmware until something else made it reconnect. It waits
+  `update_retry_backoff` first (30 s, doubling with each failure in a row up
+  to an hour), so a failure that repeats at once is not a loop; a socket closed
+  for the download waits the same before it opens again.
+- `before_update`, a function run before a download starts, to free memory.
+  One that does not return `ok` fails the update rather than the agent.
 
 ### Changed
 
@@ -57,6 +72,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still waiting went with a panic. The first such line goes at once and the
   ones within the next 250 ms together after it, so a burst of errors is a
   few messages a second, inside NervesHub's limit of 5, not one per line.
+- An armed update counts as busy until the reboot: offered again before then,
+  it is not downloaded into the other slot, which by then holds the previous
+  firmware. The owner hears `{update_ignored, armed}`; `apply_update/2` gets
+  `{update_decision_ignored, armed}`, and `request_update/1` `{error, armed}`.
+- A status update made while the device is not joined (`started`, `completed`,
+  `failed`) waits for the next join, in order, rather than being dropped; the
+  latest of each status is kept.
 - A download resumes for as long as connections keep bringing bytes, in place
   of five retries in all. Each connection is read with a deadline,
   `resume_after_ms` (10 s): one that goes quiet, fails or closes short is
@@ -110,6 +132,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process's state, and with it the device's private key, to the serial log and
   the crash report; a fun prints as `#Fun<..>`. Either may also be given as
   such a fun.
+- An update written and armed for the next boot was committed by any join
+  before the reboot, while the device still ran the firmware it had: the slot
+  a failed boot goes back to was dropped, and NervesHub heard the old firmware
+  validate the new. Only a reconnect between the two did it before; with the
+  socket closed for the download, reopening it after every update did.
 
 ## [0.2.0] - 2026-09-24
 
