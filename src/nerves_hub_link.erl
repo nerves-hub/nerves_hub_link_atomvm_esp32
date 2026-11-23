@@ -273,8 +273,14 @@
     handler => pid(),
     heartbeat_ms => pos_integer(),
     ping_interval_ms => pos_integer(),
+    connect_timeout_ms => pos_integer(),
+    alarms_interval_ms => pos_integer(),
+    download_idle_ms => pos_integer(),
+    download_resume_after_ms => pos_integer(),
+    download_resumes => pos_integer(),
     keep_open_above => non_neg_integer() | never,
     before_update => fun(() -> ok),
+    update_retry_backoff => {pos_integer(), pos_integer()},
     transport => module()
 }.
 
@@ -592,7 +598,7 @@ console_commands(Config) ->
     case maps:get(console_commands, Config, []) of
         Commands when is_list(Commands) ->
             case [C || C <- Commands, not console_command(C)] of
-                [] -> resolve_url(Config);
+                [] -> config_values(Config);
                 [Bad | _] -> {error, {invalid_console_command, Bad}}
             end;
         Other ->
@@ -606,6 +612,40 @@ console_command({Section, Name, Description, Fun}) ->
         Name =/= <<"help">> andalso is_binary(Description) andalso is_function(Fun, 1);
 console_command(_Other) ->
     false.
+
+%% The numbers, checked here: a wrong one would otherwise surface far from where
+%% it was set -- a negative `download_resume_after_ms' as a failed update in
+%% the middle of a download, `update_retry_backoff => {0, 0}' as no backoff at
+%% all.
+config_values(Config) ->
+    case [{Key, Value} || {Key, Value} <- maps:to_list(Config), not config_value(Key, Value)] of
+        [] -> resolve_url(Config);
+        [{Key, Value} | _] -> {error, {invalid_config, Key, Value}}
+    end.
+
+config_value(Key, Value) when
+    Key =:= heartbeat_ms;
+    Key =:= ping_interval_ms;
+    Key =:= connect_timeout_ms;
+    Key =:= log_flush_ms;
+    Key =:= log_buffer;
+    Key =:= alarms_interval_ms;
+    Key =:= download_idle_ms;
+    Key =:= download_resume_after_ms;
+    Key =:= download_resumes
+->
+    is_integer(Value) andalso Value > 0;
+config_value(Key, Value) when Key =:= reconnect_backoff; Key =:= update_retry_backoff ->
+    case Value of
+        {Min, Max} -> is_integer(Min) andalso is_integer(Max) andalso 0 < Min andalso Min =< Max;
+        _ -> false
+    end;
+config_value(keep_open_above, never) ->
+    true;
+config_value(keep_open_above, Value) ->
+    is_integer(Value) andalso Value >= 0;
+config_value(_Key, _Value) ->
+    true.
 
 %% Resolved here so that a config naming a host it cannot build a URL from
 %% fails at startup rather than inside the transport.

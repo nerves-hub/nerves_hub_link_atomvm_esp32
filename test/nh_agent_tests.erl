@@ -33,8 +33,20 @@ setup() ->
         _ -> ok
     end,
     register(?MODULE, self()),
+    %% An update armed by an earlier test is not one this test's agent armed.
+    forget_armed(),
     flush(),
     ok.
+
+forget_armed() ->
+    case whereis(nh_armed) of
+        undefined ->
+            ok;
+        Marker ->
+            unregister(nh_armed),
+            exit(Marker, kill),
+            ok
+    end.
 
 flush() ->
     receive
@@ -217,6 +229,13 @@ next_opened() ->
     receive
         {opened, _, Config} -> Config
     after 1000 -> erlang:error(never_opened)
+    end.
+
+%% Frames sent before now, so the next one read is what comes after.
+drain_sent() ->
+    case next_sent(50) of
+        nothing_sent -> ok;
+        _Frame -> drain_sent()
     end.
 
 next_closed() ->
@@ -431,10 +450,11 @@ a_failure_with_the_socket_open_reconnects_after_reporting_test() ->
 
     nh_agent:stop(Agent).
 
-%% Closed for the download, the socket opens again after the backoff too: a
-%% failure that repeats at once is not offered, failed and offered again every
-%% few seconds.
-a_failure_with_the_socket_closed_waits_before_opening_test() ->
+%% Closed for the download, the socket opens again at once after a failure:
+%% the download that needed its memory is over, and closed, the device would be
+%% out of reach for the whole backoff. The same firmware, offered on that join,
+%% is held until the backoff is over, and then the device joins again to ask.
+a_failure_with_the_socket_closed_reopens_at_once_and_holds_the_offer_test() ->
     {Agent, JoinRef} = join(#{
         keep_open_above => never,
         updater => nh_ota_progress_failed,
@@ -443,32 +463,71 @@ a_failure_with_the_socket_closed_waits_before_opening_test() ->
     send_update(Agent, JoinRef, update()),
     ?assertEqual(closed, next_closed()),
     wait_for_notice({update_failed, '_'}, 1000),
+    Failed = erlang:monotonic_time(millisecond),
+    _ = next_opened(),
+    ?assert(erlang:monotonic_time(millisecond) - Failed < 300),
+
+    drain_sent(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    ?assertEqual(<<"failed">>, maps:get(<<"status">>, wait_for_event(<<"status_update">>, 1000))),
+    send_update(Agent, JoinRef2, update()),
+    wait_for_notice({update_ignored, backing_off}, 1000),
+
+    %% after the backoff (600 to 900 ms), it joins again to be offered it
     receive
-        {opened, _, _} -> erlang:error(opened_before_the_backoff)
-    after 400 -> ok
+        closed -> ok
+    after 2000 -> erlang:error(never_rejoined)
     end,
     _ = next_opened(),
 
     nh_agent:stop(Agent).
 
-%% A new update offered while an earlier failure waits to join again starts
-%% that wait over: the join it was waiting for would close the socket in the
-%% middle of the new download, and connect beside it.
-a_new_update_cancels_the_wait_to_join_again_test() ->
+%% With the socket open too, the firmware that failed is not downloaded again
+%% before the backoff is over, however it comes to be offered.
+the_same_firmware_is_held_during_the_backoff_test() ->
     {Agent, JoinRef} = join(#{
-        updater => nh_ota_bad_then_slow, update_retry_backoff => {300, 300}
+        updater => nh_ota_progress_failed, update_retry_backoff => {5000, 5000}
     }),
+    send_update(Agent, JoinRef, update()),
+    wait_for_notice({update_failed, '_'}, 1000),
+    flush_events(),
+
+    %% the same firmware at a fresh presigned URL
     send_update(Agent, JoinRef, (update())#{
-        <<"firmware_url">> => <<"http://example.com/bad.avm">>
+        <<"firmware_url">> => <<"http://example.com/fw.avm?X-Amz-Signature=2">>
     }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertEqual({update_ignored, backing_off}, next_event(1000)),
+    ?assertEqual(no_event, next_event(300)),
+
+    nh_agent:stop(Agent).
+
+%% Lost during the backoff, the connection's own reconnect comes while the
+%% firmware is still held; the rejoin at the end of the backoff still asks.
+the_rejoin_outlives_a_lost_connection_test() ->
+    {Agent, JoinRef} = join(#{
+        updater => nh_ota_progress_failed,
+        update_retry_backoff => {600, 600},
+        reconnect_backoff => {10, 20}
+    }),
+    send_update(Agent, JoinRef, update()),
     wait_for_notice({update_failed, '_'}, 1000),
 
-    send_update(Agent, JoinRef, update()),
-    wait_for_notice({update_started, '_'}, 1000),
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    drain_sent(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+
     receive
-        closed -> erlang:error(closed_during_the_download)
-    after 800 -> ok
+        closed -> ok
+    after 2000 -> erlang:error(never_rejoined)
     end,
+    _ = next_opened(),
 
     nh_agent:stop(Agent).
 
@@ -703,6 +762,93 @@ an_armed_update_is_not_committed_on_the_next_join_test() ->
 
     nh_agent:stop(Agent),
     nh_ota_fake_esp:stop().
+
+%% An agent started again before the reboot finds the update armed, not on
+%% trial: the device still runs what it had. Taken for a trial, it would count
+%% a boot that never happened, commit the update on the first join, and
+%% download the next offer over the slot the device runs from.
+an_armed_update_outlives_an_agent_restart_test() ->
+    ok = nh_ota_fake_esp:start(),
+    Config = #{esp => nh_ota_fake_esp, updater => nh_ota_armed},
+    {Agent, JoinRef} = join(Config),
+    send_update(Agent, JoinRef, update()),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    nh_agent:stop(Agent),
+    flush_events(),
+    drain_sent(),
+
+    {ok, Agent2} = nh_agent:start(config(Config)),
+    %% The owner may be new too: it hears the reboot is still waiting.
+    ?assertEqual({update_ready, <<"alt.avm">>}, next_event(1000)),
+    _ = next_opened(),
+    Agent2 ! {websocket, fake_handle, connected},
+    [JoinRef2, Ref2 | _] = json:decode(next_sent(1000)),
+    ok = reply(Agent2, JoinRef2, Ref2, <<"device">>),
+    wait_for_notice({joined, '_'}, 1000),
+    send_update(Agent2, JoinRef2, update()),
+    Events = events(),
+    ?assert(lists:member({update_ignored, armed}, Events)),
+    ?assertNot(lists:member({firmware_committed, <<"alt.avm">>}, Events)),
+
+    Nvs = nh_ota_fake_esp:nvs(),
+    ?assertEqual(<<"alt.avm">>, maps:get({nerves_hub, pending_slot}, Nvs)),
+    ?assertEqual(<<"main.avm">>, maps:get({nerves_hub, previous_slot}, Nvs)),
+    ?assertNot(maps:is_key({nerves_hub, boot_attempts}, Nvs)),
+
+    nh_agent:stop(Agent2),
+    nh_ota_fake_esp:stop().
+
+%% A marker with nothing pending is left from an update committed or reverted
+%% since: the agent carries on as for any boot, and drops it.
+a_marker_with_nothing_pending_is_dropped_test() ->
+    ok = nh_ota_fake_esp:start(),
+    setup(),
+    Marker = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    true = register(nh_armed, Marker),
+    {ok, Agent} = nh_agent:start(config(#{esp => nh_ota_fake_esp})),
+    _ = next_opened(),
+    ?assertEqual(undefined, whereis(nh_armed)),
+
+    nh_agent:stop(Agent),
+    nh_ota_fake_esp:stop().
+
+%% The agent does not give up on a download sooner than the download's own
+%% resumes allow: quiet for 400 ms is within two resumes of 200 ms each.
+the_agent_waits_out_the_downloads_own_resumes_test() ->
+    {Agent, JoinRef} = join(#{
+        updater => nh_ota_quiet,
+        download_idle_ms => 100,
+        download_resume_after_ms => 200,
+        download_resumes => 2
+    }),
+    send_update(Agent, JoinRef, update()),
+    ?assertNot(lists:member({update_failed, download_stalled}, events_until_ready())),
+
+    nh_agent:stop(Agent).
+
+events_until_ready() ->
+    case next_event(2000) of
+        no_event -> erlang:error(never_ready);
+        {update_ready, _} -> [];
+        Event -> [Event | events_until_ready()]
+    end.
+
+%% Past what its resumes allow, a quiet download is still given up on.
+a_download_quiet_past_its_resumes_is_given_up_test() ->
+    {Agent, JoinRef} = join(#{
+        updater => nh_ota_waiting,
+        download_idle_ms => 100,
+        download_resume_after_ms => 50,
+        download_resumes => 1
+    }),
+    send_update(Agent, JoinRef, update()),
+    wait_for_notice({update_failed, download_stalled}, 1000),
+
+    nh_agent:stop(Agent).
 
 %% Lost, not closed for the download, a connection keeps its backoff: the
 %% download ending does not open it early.

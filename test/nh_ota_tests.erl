@@ -540,3 +540,10 @@ arming_resets_the_count() ->
     nh_ota_fake_flash:stop(),
 
     ?assertEqual({trial, ?SLOT, 1}, nh_ota:begin_trial(3, esp())).
+
+%% The longest a download goes without a word while it still has resumes left,
+%% and one deadline to spare.
+quiet_limit_test() ->
+    ?assertEqual(40000, nh_ota:quiet_limit(#{})),
+    ?assertEqual(240000, nh_ota:quiet_limit(#{resume_after_ms => 60000})),
+    ?assertEqual(600, nh_ota:quiet_limit(#{resume_after_ms => 200, resumes => 2})).

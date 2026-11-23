@@ -71,6 +71,43 @@ a_config_that_cannot_build_a_url_is_refused_test() ->
         nerves_hub_link:start(config(#{host => <<"nh.example.com">>}))
     ).
 
+%% A wrong number is an error from start, not something that surfaces far from
+%% where it was set.
+a_wrong_number_is_refused_at_start_test() ->
+    Wrong = [
+        {download_resume_after_ms, -1},
+        {download_resumes, 0},
+        {download_idle_ms, 1.5},
+        {heartbeat_ms, "30000"},
+        {alarms_interval_ms, 0},
+        {connect_timeout_ms, infinity},
+        {update_retry_backoff, {0, 0}},
+        {update_retry_backoff, {2000, 1000}},
+        {reconnect_backoff, 1000},
+        {keep_open_above, -1},
+        {keep_open_above, always}
+    ],
+    [
+        ?assertEqual(
+            {error, {invalid_config, Key, Value}},
+            nerves_hub_link:start(config(#{firmware => none, Key => Value}))
+        )
+     || {Key, Value} <- Wrong
+    ].
+
+a_right_number_is_taken_test() ->
+    setup(),
+    {ok, Pid} = nerves_hub_link:start(
+        config(#{
+            firmware => none,
+            download_resume_after_ms => 60000,
+            download_resumes => 5,
+            update_retry_backoff => {1000, 1000},
+            keep_open_above => 0
+        })
+    ),
+    ok = nerves_hub_link:stop(Pid).
+
 %% A wrong console command is an error from start, not a crash of the agent
 %% afterwards, or the first time someone types `help'.
 a_wrong_console_command_is_refused_at_start_test() ->

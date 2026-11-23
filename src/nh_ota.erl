@@ -50,6 +50,7 @@
 -export([pending/0, pending/1, commit/0, commit/1, revert/0, revert/1]).
 -export([begin_trial/1, begin_trial/2, reverted/0, reverted/1]).
 -export([parse_url/1, digest_matches/2]).
+-export([quiet_limit/1]).
 
 %% Our own NVS namespace. `atomvm' belongs to the loader, and writing our
 %% bookkeeping into it would be writing into someone else's keys.
@@ -298,6 +299,22 @@ recv_loop({Reader, _Monitor} = R, #{opts := Opts} = State) ->
     after maps:get(resume_after_ms, Opts, ?RESUME_AFTER_MS) ->
         resume(R, {error, download_stalled}, State)
     end.
+
+%%-----------------------------------------------------------------------------
+%% @doc The longest a download with these options goes without a word to its
+%% owner while it is still within its budget of resumes.
+%%
+%% After a resume it waits `Stuck * resume_after_ms' before connecting again,
+%% and a connection that then brings nothing takes `resume_after_ms' more to
+%% give up on: at most `resumes * resume_after_ms' between two `resumed'. This
+%% is that, and one deadline to spare. An owner that gives up on a quiet
+%% download sooner cuts off one that would have carried on; `nh_agent' keeps
+%% its `download_idle_ms' at least this long.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec quiet_limit(map()) -> pos_integer().
+quiet_limit(Opts) ->
+    (maps:get(resumes, Opts, ?RESUMES) + 1) * maps:get(resume_after_ms, Opts, ?RESUME_AFTER_MS).
 
 %% Every byte arrived and only the end of the response did not: asking for
 %% `bytes=Size-' would be answered 416, so it is done.
