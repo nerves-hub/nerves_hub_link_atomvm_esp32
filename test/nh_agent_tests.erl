@@ -702,6 +702,42 @@ join_device(Extra) ->
     _Interface = wait_for_event(<<"report_network_interface">>, 1000),
     {Agent, JoinRef}.
 
+%% ---------------------------------------------------------------- credentials
+
+%% A crash prints the agent's state: the key and the secret must not be in it.
+credentials_are_sealed_test() ->
+    Config = nh_agent:seal(
+        config(#{
+            client_cert => {<<"CERT">>, <<"PRIVATE KEY">>},
+            shared_secret => {<<"nhp_key">>, <<"SECRET">>}
+        })
+    ),
+    Printed = lists:flatten(io_lib:format("~p", [Config])),
+    ?assertEqual(nomatch, string:find(Printed, "PRIVATE KEY")),
+    ?assertEqual(nomatch, string:find(Printed, "SECRET")).
+
+%% Sealed or not, the transport gets the pair itself.
+the_transport_gets_the_client_cert_test() ->
+    setup(),
+    Pair = {<<"cert">>, <<"key">>},
+    lists:foreach(
+        fun(Given) ->
+            {ok, Agent} = nh_agent:start(config(#{client_cert => Given})),
+            ?assertEqual(Pair, maps:get(client_cert, next_opened())),
+            nh_agent:stop(Agent)
+        end,
+        [Pair, fun() -> Pair end]
+    ).
+
+%% A sealed secret still signs the connection.
+a_sealed_shared_secret_signs_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(
+        config(#{shared_secret => fun() -> {<<"nhp_key">>, <<"secret">>} end})
+    ),
+    ?assertEqual(<<"nhp_key">>, header(<<"x-nh-key">>, next_opened())),
+    nh_agent:stop(Agent).
+
 %% ---------------------------------------------------------------- reconnecting
 
 %% The transport must not reconnect on its own: it would replay headers signed

@@ -55,6 +55,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1.1 KB answer. Shorter output (the echo of a keystroke,
   a prompt) stays where it was: a process per keystroke would fragment the
   heap instead.
+- `client_cert` and `shared_secret` are kept sealed in a fun in the agent's
+  state and opened only to build the socket's options. A crash prints the
+  process's state, and with it the device's private key, to the serial log and
+  the crash report; a fun prints as `#Fun<..>`. Either may also be given as
+  such a fun.
 
 ## [0.2.0] - 2026-09-24
 
