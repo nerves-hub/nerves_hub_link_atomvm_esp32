@@ -287,6 +287,61 @@ an_available_update_is_downloaded_and_failures_reported_test() ->
 
     nh_agent:stop(Agent).
 
+%% A resume is a sign of life: the download reconnected and asked for the
+%% rest. The owner hears where it resumed from.
+a_resumed_download_is_not_given_up_test() ->
+    {Agent, JoinRef} = join(#{updater => nh_ota_resumed, download_idle_ms => 200}),
+
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ?assertMatch({message, <<"update">>, _}, next_event(1000)),
+    ?assertMatch({update_started, _}, next_event(1000)),
+    ?assertEqual({download_resumed, 4096}, next_event(1000)),
+    ?assertEqual({update_ready, <<"alt.avm">>}, next_event(1000)),
+
+    nh_agent:stop(Agent).
+
+%% A device on a slow link sets the download's deadlines from the agent's
+%% config; left out, the downloader's defaults stand.
+the_download_options_come_from_the_config_test() ->
+    Test = self(),
+    Probe = spawn(fun Forward() ->
+        receive
+            stop ->
+                ok;
+            Message ->
+                Test ! Message,
+                Forward()
+        end
+    end),
+    true = register(nh_ota_opts_probe, Probe),
+    Update = #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    },
+    Opts = fun(Config) ->
+        {Agent, JoinRef} = join(Config#{updater => nh_ota_opts}),
+        send_update(Agent, JoinRef, Update),
+        receive
+            {opts, O} ->
+                nh_agent:stop(Agent),
+                O
+        after 1000 -> erlang:error(no_update)
+        end
+    end,
+    Set = Opts(#{download_resume_after_ms => 30000, download_resumes => 5}),
+    ?assertMatch(#{resume_after_ms := 30000, resumes := 5}, Set),
+    Default = Opts(#{}),
+    ?assertNot(is_map_key(resume_after_ms, Default)),
+    ?assertNot(is_map_key(resumes, Default)),
+    Probe ! stop.
+
 %% `update_available => false' is NervesHub saying there is nothing to do.
 an_unavailable_update_starts_nothing_test() ->
     {Agent, JoinRef} = join(#{}),
@@ -328,8 +383,11 @@ wait_for_event(Event, Timeout) ->
 
 %% Joins both topics and answers both joins, returning the console's join ref.
 join_with_console() ->
+    join_with_console(#{}).
+
+join_with_console(Extra) ->
     setup(),
-    {ok, Agent} = nh_agent:start(config(#{console => true})),
+    {ok, Agent} = nh_agent:start(config(Extra#{console => true})),
     _ = next_opened(),
     Agent ! {websocket, fake_handle, connected},
 
@@ -392,6 +450,19 @@ keystrokes_are_echoed_back_test() ->
 
     nh_agent:stop(Agent).
 
+%% The application's own commands answer on the console as the built-in ones do.
+an_application_command_answers_on_the_console_topic_test() ->
+    {Agent, JoinRef} = join_with_console(#{
+        console_commands => [{<<"relays">>, <<"the relay states">>, fun(_) -> <<"r1 on">> end}]
+    }),
+    _Banner = wait_for_event(<<"up">>, 1000),
+
+    send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"relays\r">>}),
+    #{<<"data">> := Data} = wait_for_event(<<"up">>, 1000),
+    ?assertMatch({_, _}, binary:match(Data, <<"r1 on">>)),
+
+    nh_agent:stop(Agent).
+
 a_command_answers_on_the_console_topic_test() ->
     {Agent, JoinRef} = join_with_console(),
     _Banner = wait_for_event(<<"up">>, 1000),
@@ -402,6 +473,35 @@ a_command_answers_on_the_console_topic_test() ->
     ?assertMatch({_, _}, binary:match(Data, <<"reboot">>)),
 
     nh_agent:stop(Agent).
+
+%% Only output longer than one piece is encoded in a helper process: one per
+%% keystroke fragmented a device's memory.
+only_long_output_is_encoded_in_a_helper_test() ->
+    {Agent, JoinRef} = join_with_console(),
+    _Banner = wait_for_event(<<"up">>, 1000),
+    erlang:trace(Agent, true, [procs]),
+
+    send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"h">>}),
+    ?assertEqual(#{<<"data">> => <<"h">>}, wait_for_event(<<"up">>, 1000)),
+    ?assertEqual([], spawns(Agent)),
+
+    %% `help' answers with more than one piece.
+    send_console(Agent, JoinRef, <<"dn">>, #{<<"data">> => <<"elp\r">>}),
+    Data = console_until_prompt(<<>>),
+    ?assert(byte_size(Data) > 256),
+    ?assertMatch([_], spawns(Agent)),
+
+    erlang:trace(Agent, false, [procs]),
+    nh_agent:stop(Agent).
+
+%% The processes Agent spawned, as the trace has told so far.
+spawns(Agent) ->
+    receive
+        {trace, Agent, spawn, Pid, _} -> [Pid | spawns(Agent)];
+        {trace, Agent, _Event, _Info} -> spawns(Agent);
+        {trace, Agent, _Event, _Info, _} -> spawns(Agent)
+    after 100 -> []
+    end.
 
 %% Output longer than one piece arrives in several `up's; the prompt ends it.
 console_until_prompt(Acc) ->
@@ -537,6 +637,23 @@ a_health_check_is_answered_with_a_report_test() ->
 
     nh_agent:stop(Agent).
 
+%% The health report carries what the application says is raised, and a
+%% callback that fails or answers nonsense reports nothing raised.
+a_report_carries_the_applications_alarms_test() ->
+    Alarms = #{<<"LowMemory">> => <<"largest free block 20000 bytes">>},
+    lists:foreach(
+        fun({Fun, Expected}) ->
+            {Agent, Ref, _} = join_with_extensions(
+                #{extensions => [health], alarms => Fun}, [<<"health">>], advert()
+            ),
+            send_extension(Agent, Ref, <<"health:check">>, #{}),
+            Payload = wait_for_event(<<"health:report">>, 2000),
+            ?assertEqual(Expected, maps:get(<<"alarms">>, maps:get(<<"value">>, Payload))),
+            nh_agent:stop(Agent)
+        end,
+        [{fun() -> Alarms end, Alarms}, {fun() -> error(boom) end, #{}}, {fun() -> nope end, #{}}]
+    ).
+
 %% The platform asking for something it never turned on is not answered.
 a_check_for_a_detached_extension_is_ignored_test() ->
     {Agent, Ref, _} = join_with_extensions([health, geo], [<<"geo">>]),
@@ -611,6 +728,98 @@ a_batch_stops_at_its_byte_limit_test() ->
 
     nh_agent:stop(Agent).
 
+%% An error may be the last thing a device says: it does not wait for the timer.
+an_error_line_goes_at_once_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 60000}, [<<"logging">>], advert()
+    ),
+
+    ok = nerves_hub_link:send_log(Agent, <<"info">>, <<"before">>),
+    ok = nerves_hub_link:send_log(Agent, <<"error">>, <<"boom">>),
+    #{<<"lines">> := Lines} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual([<<"before">>, <<"boom">>], [maps:get(<<"message">>, L) || L <- Lines]),
+
+    nh_agent:stop(Agent).
+
+%% A burst of errors is not a message per line: NervesHub takes 5 a second and
+%% would drop the rest. The first goes at once, the others together a moment
+%% later.
+a_burst_of_errors_goes_in_two_messages_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 60000}, [<<"logging">>], advert()
+    ),
+
+    [
+        ok = nerves_hub_link:send_log(Agent, <<"error">>, integer_to_binary(N))
+     || N <- lists:seq(1, 20)
+    ],
+    #{<<"lines">> := First} = wait_for_event(<<"logging:send">>, 1000),
+    #{<<"lines">> := Second} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual(20, length(First) + length(Second)),
+    ?assertEqual(0, count_events(<<"logging:send">>, 500)),
+
+    nh_agent:stop(Agent).
+
+%% How many `Event's are sent before nothing is for `Timeout' ms.
+count_events(Event, Timeout) ->
+    case next_sent(Timeout) of
+        nothing_sent ->
+            0;
+        Frame ->
+            case json:decode(Frame) of
+                [_, _, _, Event, _] -> 1 + count_events(Event, Timeout);
+                _Other -> count_events(Event, Timeout)
+            end
+    end.
+
+%% A restart on purpose asks first, so the lines that say why are not lost.
+flush_logs_sends_what_is_waiting_test() ->
+    {Agent, _Ref, _} = join_with_extensions(
+        #{extensions => [logging], log_flush_ms => 60000}, [<<"logging">>], advert()
+    ),
+
+    ok = nerves_hub_link:send_log(Agent, <<"info">>, <<"restarting: test">>),
+    ?assertEqual(ok, nerves_hub_link:flush_logs(Agent, 1000)),
+    #{<<"lines">> := [Line]} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual(<<"restarting: test">>, maps:get(<<"message">>, Line)),
+    ?assertEqual({error, no_agent}, nerves_hub_link:flush_logs(no_such_agent, 100)),
+
+    nh_agent:stop(Agent).
+
+%% A download is when a board without PSRAM runs out of memory: what it logs
+%% then goes at once.
+lines_logged_during_a_download_go_at_once_test() ->
+    {Agent, Ref, _} = join_with_extensions(
+        #{
+            extensions => [logging],
+            log_flush_ms => 60000,
+            updater => nh_ota_waiting
+        },
+        [<<"logging">>],
+        advert()
+    ),
+    Frame = json:encode([
+        Ref,
+        null,
+        <<"device">>,
+        <<"update">>,
+        #{
+            <<"update_available">> => true,
+            <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+            <<"size">> => 1024,
+            <<"checksum">> => <<"abc">>
+        }
+    ]),
+    Agent ! {websocket, fake_handle, {text, iolist_to_binary(Frame)}},
+    Received = wait_for_event(<<"status_update">>, 1000),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, Received)),
+
+    ok = nerves_hub_link:send_log(Agent, <<"info">>, <<"downloading">>),
+    #{<<"lines">> := [Line]} = wait_for_event(<<"logging:send">>, 1000),
+    ?assertEqual(<<"downloading">>, maps:get(<<"message">>, Line)),
+
+    nh_agent:stop(Agent).
+
 %% ------------------------------------------------------------------ actions
 
 send_device(Agent, JoinRef, Event) ->
@@ -672,6 +881,42 @@ join_device(Extra) ->
     ?assertMatch({joined, _}, next_event(1000)),
     _Interface = wait_for_event(<<"report_network_interface">>, 1000),
     {Agent, JoinRef}.
+
+%% ---------------------------------------------------------------- credentials
+
+%% A crash prints the agent's state: the key and the secret must not be in it.
+credentials_are_sealed_test() ->
+    Config = nh_agent:seal(
+        config(#{
+            client_cert => {<<"CERT">>, <<"PRIVATE KEY">>},
+            shared_secret => {<<"nhp_key">>, <<"SECRET">>}
+        })
+    ),
+    Printed = lists:flatten(io_lib:format("~p", [Config])),
+    ?assertEqual(nomatch, string:find(Printed, "PRIVATE KEY")),
+    ?assertEqual(nomatch, string:find(Printed, "SECRET")).
+
+%% Sealed or not, the transport gets the pair itself.
+the_transport_gets_the_client_cert_test() ->
+    setup(),
+    Pair = {<<"cert">>, <<"key">>},
+    lists:foreach(
+        fun(Given) ->
+            {ok, Agent} = nh_agent:start(config(#{client_cert => Given})),
+            ?assertEqual(Pair, maps:get(client_cert, next_opened())),
+            nh_agent:stop(Agent)
+        end,
+        [Pair, fun() -> Pair end]
+    ).
+
+%% A sealed secret still signs the connection.
+a_sealed_shared_secret_signs_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(
+        config(#{shared_secret => fun() -> {<<"nhp_key">>, <<"secret">>} end})
+    ),
+    ?assertEqual(<<"nhp_key">>, header(<<"x-nh-key">>, next_opened())),
+    nh_agent:stop(Agent).
 
 %% ---------------------------------------------------------------- reconnecting
 

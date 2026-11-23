@@ -11,6 +11,29 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for a device that moves between networks without restarting the agent.
 - `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,
   passed to the transport.
+- `nerves_hub_link:flush_logs/2` sends the log lines waiting for a batch, for
+  an application about to restart the device on purpose.
+- `{download_resumed, Offset}` to the owner for each resume, which also counts
+  as progress against `download_idle_ms`.
+- `console_commands` adds the application's own console commands, as `{Name,
+  Description, Fun}` or `{Section, Name, Description, Fun}`. `help` lists the
+  commands by section (`device`, `network`, then the application's); one with a
+  built-in's name replaces it, and one that raises prints the error. A wrong
+  entry, or one named `help`, is refused at start as
+  `{invalid_console_command, Entry}`.
+- The console's up and down arrows walk through the last 20 lines entered, as
+  a shell does, and `clear` clears the screen (and prints nothing in a support
+  script). A line is at most 256 bytes.
+- The `alarms` extension (0.1.0): with `extensions => [alarms]` and an
+  `alarms => Fun`, the agent asks for the alarms every `alarms_interval_ms`
+  (30 s by default) and sends `alarms:raised` / `alarms:cleared` as they
+  change, and `alarms:snapshot` when NervesHub sends `alarms:sync`. Alarms
+  raised while offline keep the time they were raised. With it attached, the
+  health report leaves the `alarms` key out. A `Fun` of one argument is given
+  the set it returned last time, for hysteresis without state of its own; a
+  callback that fails leaves what was raised as it was.
+- `alarms => Fun` alone puts the application's alarms on the health report,
+  which sent `#{}` before.
 
 ### Changed
 
@@ -28,6 +51,35 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after a rejoin, when the TLS handshake has just taken its share of the heap,
   and a hundred lines of a few hundred bytes each ran an ESP32 without PSRAM
   out of memory there. The first line always goes, however long.
+- Log lines no longer wait for the batch timer when the device may be about
+  to go down: a line at `error` or worse, and any line while an update
+  downloads, goes soon, and a `reboot` sends what is waiting first. A batch
+  still waiting went with a panic. The first such line goes at once and the
+  ones within the next 250 ms together after it, so a burst of errors is a
+  few messages a second, inside NervesHub's limit of 5, not one per line.
+- A download resumes for as long as connections keep bringing bytes, in place
+  of five retries in all. Each connection is read with a deadline,
+  `resume_after_ms` (10 s): one that goes quiet, fails or closes short is
+  dropped and the rest asked for with `Range`. It gives up after `resumes` (3)
+  connections in a row that brought no byte past the furthest any connection
+  reached, waiting `resume_after_ms` times that count before each. A response
+  that ends short of the size is resumed too, and one that ends after every
+  byte arrived is done. The agent passes its `download_resume_after_ms` and
+  `download_resumes` on as these two. Over a cellular modem every connection
+  carried 20-200 KB and then went silent, and the retries ran out on a slow
+  day.
+  `max_retries` and `retry_backoff` are gone, and errors are no longer wrapped
+  in `download_failed`: the reason is what failed (`{connect_failed, _}`,
+  `{http_status, 503}`, `download_stalled`).
+- Each flash sector is erased just before it is written, in place of the
+  whole archive before the download. An erase holds the CPU, and AtomVM's
+  scheduler with it: a ~460 KB archive erased up front stopped every process
+  for seconds, long enough for a call elsewhere in the application to time out.
+- An update bigger than the slot it would overwrite is refused before
+  anything is erased, as `{error, {update_too_big, Size, SlotSize}}`, instead
+  of failing halfway through the download with the slot already half
+  rewritten.
+- `extensions => all` includes `alarms`.
 
 ### Fixed
 
@@ -40,6 +92,24 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSON-encoded in the agent, which on AtomVM costs the process many times the
   output's size in heap: a 2 KB answer with quotes in it took more than an
   ESP32 without PSRAM had in one block, and the device panicked.
+- Console output longer than one 256-byte piece is encoded in a short-lived
+  process, not on the agent's heap. Encoding a piece builds several times its
+  size in garbage (every quote in a command's JSON output is escaped); on the
+  agent's heap that garbage grew it into one contiguous block of its whole new
+  size, which an ESP32 without PSRAM short of memory did not have for a
+  1.1 KB answer. Shorter output (the echo of a keystroke,
+  a prompt) stays where it was: a process per keystroke would fragment the
+  heap instead.
+- `capture_io` with `register => Name` captures by the name, through one
+  capture per name registered as `nh_io_capture_Name`; agents under other names
+  have their own. An agent started again under the name used to
+  get a new capture each time, and the old one stayed alive sending to the dead
+  agent, along with every process that had inherited it.
+- `client_cert` and `shared_secret` are kept sealed in a fun in the agent's
+  state and opened only to build the socket's options. A crash prints the
+  process's state, and with it the device's private key, to the serial log and
+  the crash report; a fun prints as `#Fun<..>`. Either may also be given as
+  such a fun.
 
 ## [0.2.0] - 2026-09-24
 

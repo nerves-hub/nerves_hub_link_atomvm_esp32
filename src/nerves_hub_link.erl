@@ -48,6 +48,7 @@
 %% {join_error, Reason}
 %% {message, Event, Payload}    %% "update" and friends
 %% {update_started, Pid}
+%% {download_resumed, Offset}  %% reconnected, asking from this byte
 %% {update_ready, Slot}         %% written and armed; reboot when ready
 %% {update_failed, Reason}
 %% {firmware_committed, Slot}   %% the running update proved itself
@@ -76,6 +77,8 @@
 %%
 %% Either `shared_secret => {Key, Secret}' or `client_cert => {CertPem, KeyPem}'.
 %% Which one to use is an organization's choice, and NervesHub accepts both.
+%% Either pair may also be given as a fun that returns it, and the agent keeps
+%% it as one, so that a crash report never prints the key (see `nh_agent').
 %%
 %% A shared-secret signature is time-bound: NervesHub refuses one signed more
 %% than 90 seconds ago. An ESP32 boots at the epoch, so the clock has to be set
@@ -89,6 +92,17 @@
 %% Nerves `nerves_hub_link' answers that channel with a real IEx session; AtomVM
 %% has no shell, so this answers it with a debug terminal instead — a fixed set
 %% of commands, listed by `help'. See `nh_console'.
+%%
+%% `console_commands' adds the application's own, as `{Name, Description,
+%% Fun}', or `{Section, Name, Description, Fun}' to list it under a section of
+%% `help': `Fun' gets the line's arguments and returns the output. The names,
+%% sections and descriptions are binaries, and `help' is taken; anything else
+%% is refused at start as `{invalid_console_command, Entry}'.
+%%
+%% `Fun' runs in the agent's process. While it runs the agent sends no
+%% heartbeat and reads no frame, so it must be quick; and it must not call
+%% `nerves_hub_link', whose calls go to the agent and would wait on themselves
+%% until they time out.
 %%
 %% It reports, and it reboots. It will not evaluate Erlang, and it is not a way
 %% in to a running system.
@@ -144,7 +158,10 @@
 %% process and everything it starts afterwards print is forwarded as well as
 %% shown on the console. The text arrives unstructured, at one level, timed on
 %% arrival -- there is no level or module in an `io:format' call to carry over.
-%% ESP-IDF's own `I (1234) wifi: ...' lines are written from C and are not
+%% With `register => Name', the capture sends to that name and is registered
+%% itself as `nh_io_capture_Name': an agent started again under the name reuses
+%% it rather than leaving a capture behind per restart, and agents under other
+%% names each have their own. ESP-IDF's own `I (1234) wifi: ...' lines are written from C and are not
 %% caught by anything here.
 %%
 %% One thing to change when turning it on: `logger' runs its handlers in the
@@ -218,6 +235,7 @@
 -export([push/3]).
 -export([send_log/3, send_log/4]).
 -export([check_for_update/1, request_update/1, set_update_mode/2, update_mode/1]).
+-export([flush_logs/2]).
 -export([apply_update/2, ignore_update/2, reschedule_update/3]).
 
 -type firmware_source() :: boot | {partition, binary()} | {metadata, map()} | none.
@@ -227,11 +245,13 @@
     host => binary() | string(),
     identifier := binary(),
     firmware => firmware_source(),
-    shared_secret => {binary(), binary()},
-    client_cert => {binary(), binary()},
+    shared_secret => nh_agent:credentials(),
+    client_cert => nh_agent:credentials(),
     verify => crt_bundle | {cacert_pem, binary()} | none,
     console => boolean(),
-    extensions => all | [health | geo | logging],
+    console_commands => [nh_console:command()],
+    extensions => all | [health | geo | logging | alarms],
+    alarms => fun(() -> #{binary() => binary()}) | fun((map()) -> #{binary() => binary()}),
     reboot => auto | manual,
     updates => auto | manual,
     firmware_keys => [binary() | string()],
@@ -432,6 +452,37 @@ reschedule_update(Pid, DelayMs, Reason) when is_integer(DelayMs), DelayMs > 0, i
     Pid ! {update_decision, {reschedule, DelayMs, Reason}},
     ok.
 
+%%-----------------------------------------------------------------------------
+%% @doc Send the log lines waiting for a batch now, and wait for them to be
+%% handed to the socket, for up to `TimeoutMs'.
+%%
+%% For an application about to restart the device on purpose: the lines it
+%% logged on the way down say why, and a batch still waiting would go with it.
+%% Lines at `error' or worse, and lines logged while an update downloads, are
+%% sent at once anyway.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec flush_logs(pid() | atom(), non_neg_integer()) -> ok | {error, term()}.
+flush_logs(Name, TimeoutMs) when is_atom(Name) ->
+    case whereis(Name) of
+        undefined -> {error, no_agent};
+        Pid -> flush_logs(Pid, TimeoutMs)
+    end;
+flush_logs(Pid, TimeoutMs) ->
+    Monitor = erlang:monitor(process, Pid),
+    Tag = make_ref(),
+    Pid ! {call, self(), Tag, flush_logs},
+    receive
+        {Tag, Reply} ->
+            erlang:demonitor(Monitor, [flush]),
+            Reply;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            {error, {agent_down, Reason}}
+    after TimeoutMs ->
+        erlang:demonitor(Monitor, [flush]),
+        {error, timeout}
+    end.
+
 %% ------------------------------------------------------------------- internals
 
 %% NervesHub gives a request 30 seconds and the agent times it out then; this
@@ -479,24 +530,73 @@ with_agent_config(Config, Start) ->
 capture_io(Config, Agent) ->
     case maps:get(capture_io, Config, false) of
         false -> ok;
-        true -> capture(#{agent => Agent});
-        Options when is_map(Options) -> capture(Options#{agent => Agent})
+        true -> capture(#{}, Config, Agent);
+        Options when is_map(Options) -> capture(Options, Config, Agent)
     end.
 
-capture(Options) ->
-    {ok, Capture} = nh_io_capture:start(Options),
+%% A registered agent is captured by its name, through one capture per name. An
+%% agent started again under the same name finds it there, so the processes
+%% that inherited it keep reaching the new agent, and no capture is left behind
+%% sending to a dead one. An agent under another name has a capture of its own,
+%% with its own options.
+capture(Options, #{register := Name}, _Agent) ->
+    nh_io_capture:attach(named_capture(capture_name(Name), Options#{agent => Name}));
+capture(Options, _Config, Agent) ->
+    {ok, Capture} = nh_io_capture:start(Options#{agent => Agent}),
     nh_io_capture:attach(Capture).
+
+capture_name(Name) ->
+    list_to_atom("nh_io_capture_" ++ atom_to_list(Name)).
+
+%% Two agents of one name starting at the same moment both find no capture;
+%% the one whose register fails uses the winner's and stops its own.
+named_capture(CaptureName, Options) ->
+    case whereis(CaptureName) of
+        undefined ->
+            {ok, Pid} = nh_io_capture:start(Options),
+            try register(CaptureName, Pid) of
+                true -> Pid
+            catch
+                error:badarg ->
+                    ok = nh_io_capture:stop(Pid),
+                    named_capture(CaptureName, Options)
+            end;
+        Pid ->
+            Pid
+    end.
 
 validate(Config) ->
     case missing_keys(Config) of
         [] ->
             case usable_clock(Config) of
-                ok -> resolve_url(Config);
+                ok -> console_commands(Config);
                 {error, _} = Error -> Error
             end;
         Missing ->
             {error, {missing_config, Missing}}
     end.
+
+%% Checked here so a wrong entry is an error from `start_link', not a crash of
+%% the agent after it returned `{ok, Pid}', or the first time someone types
+%% `help'. `help' is the console's own and cannot be replaced.
+console_commands(Config) ->
+    case maps:get(console_commands, Config, []) of
+        Commands when is_list(Commands) ->
+            case [C || C <- Commands, not console_command(C)] of
+                [] -> resolve_url(Config);
+                [Bad | _] -> {error, {invalid_console_command, Bad}}
+            end;
+        Other ->
+            {error, {invalid_console_command, Other}}
+    end.
+
+console_command({Name, Description, Fun}) ->
+    console_command({<<"application">>, Name, Description, Fun});
+console_command({Section, Name, Description, Fun}) ->
+    is_binary(Section) andalso is_binary(Name) andalso Name =/= <<>> andalso
+        Name =/= <<"help">> andalso is_binary(Description) andalso is_function(Fun, 1);
+console_command(_Other) ->
+    false.
 
 %% Resolved here so that a config naming a host it cannot build a URL from
 %% fails at startup rather than inside the transport.

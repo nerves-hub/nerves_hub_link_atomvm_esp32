@@ -71,6 +71,31 @@ a_config_that_cannot_build_a_url_is_refused_test() ->
         nerves_hub_link:start(config(#{host => <<"nh.example.com">>}))
     ).
 
+%% A wrong console command is an error from start, not a crash of the agent
+%% afterwards, or the first time someone types `help'.
+a_wrong_console_command_is_refused_at_start_test() ->
+    Fun = fun(_) -> <<>> end,
+    Wrong = [
+        {<<"a">>, Fun},
+        #{name => <<"a">>},
+        {"a", <<"charlist name">>, Fun},
+        {<<"a">>, "charlist description", Fun},
+        {section, <<"a">>, <<"atom section">>, Fun},
+        {<<"a">>, <<"no arguments">>, fun() -> <<>> end},
+        {<<"help">>, <<"taken">>, Fun}
+    ],
+    [
+        ?assertEqual(
+            {error, {invalid_console_command, Entry}},
+            nerves_hub_link:start(config(#{firmware => none, console_commands => [Entry]}))
+        )
+     || Entry <- Wrong
+    ],
+    ?assertEqual(
+        {error, {invalid_console_command, nope}},
+        nerves_hub_link:start(config(#{firmware => none, console_commands => nope}))
+    ).
+
 %% What an Elixir caller writes. The library is meant to be usable from Elixir
 %% without a wrapper in between, and a map with atom keys is not what anyone
 %% reaches for there first.
@@ -177,6 +202,72 @@ a_taken_name_is_refused_test() ->
 
     true = unregister(Name),
     exit(Squatter, kill).
+
+%% An agent restarted under the same name -- the application's way out of a
+%% connection that will not come back -- keeps the one capture, so nothing is
+%% left behind per restart and what was started before it still reaches the new
+%% agent. Run from its own process: the capture becomes the caller's group
+%% leader, and eunit's must stay its own.
+a_restarted_registered_agent_keeps_its_capture_test() ->
+    setup(),
+    Name = list_to_atom("nh_cap_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    Test = self(),
+    Config = config(#{firmware => none, register => Name, capture_io => #{echo => false}}),
+    Starter = spawn(fun() ->
+        {ok, First} = nerves_hub_link:start(Config),
+        Leader = group_leader(),
+        Ref = monitor(process, First),
+        ok = nerves_hub_link:stop(First),
+        receive
+            {'DOWN', Ref, process, First, _} -> ok
+        end,
+        {ok, Second} = nerves_hub_link:start(Config),
+        Test ! {started, Leader, group_leader(), Second}
+    end),
+
+    receive
+        {started, Leader, Again, Agent} ->
+            ?assertEqual(Leader, Again),
+            ?assertEqual(Leader, whereis(list_to_atom("nh_io_capture_" ++ atom_to_list(Name)))),
+            ok = nerves_hub_link:stop(Agent),
+            ok = nh_io_capture:stop(Leader)
+    after 2000 ->
+        exit(Starter, kill),
+        erlang:error(no_restart)
+    end.
+
+%% Agents under two names have a capture each: the second does not send its
+%% output to the first, and keeps its own options.
+agents_under_two_names_have_a_capture_each_test() ->
+    setup(),
+    Test = self(),
+    Start = fun(Echo) ->
+        Name = list_to_atom("nh_cap_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        spawn(fun() ->
+            {ok, Agent} = nerves_hub_link:start(
+                config(#{firmware => none, register => Name, capture_io => #{echo => Echo}})
+            ),
+            Test ! {started, self(), Name, group_leader(), Agent}
+        end)
+    end,
+    Started = [
+        receive
+            {started, Pid, Name, Leader, Agent} -> {Name, Leader, Agent}
+        after 2000 -> erlang:error(no_start)
+        end
+     || Pid <- [Start(false), Start(true)]
+    ],
+    [{Name1, Leader1, _}, {Name2, Leader2, _}] = Started,
+    ?assertNotEqual(Leader1, Leader2),
+    ?assertEqual(Leader1, whereis(list_to_atom("nh_io_capture_" ++ atom_to_list(Name1)))),
+    ?assertEqual(Leader2, whereis(list_to_atom("nh_io_capture_" ++ atom_to_list(Name2)))),
+    [
+        begin
+            ok = nerves_hub_link:stop(Agent),
+            ok = nh_io_capture:stop(Leader)
+        end
+     || {_, Leader, Agent} <- Started
+    ].
 
 explicit_none_is_allowed_test() ->
     setup(),

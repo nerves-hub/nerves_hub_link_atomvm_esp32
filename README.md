@@ -137,6 +137,7 @@ The calling process receives `{nerves_hub, Event}`:
 | `{join_error, Reason}` | The server refused the join |
 | `{message, Event, Payload}` | A server message this library does not handle itself |
 | `{update_started, Pid}` | An update is downloading |
+| `{download_resumed, Offset}` | The download reconnected and asked for the rest from `Offset` |
 | `{update_ready, Slot}` | Written and armed; reboot when convenient |
 | `{update_failed, Reason}` | Refused, or the write failed |
 | `{firmware_committed, Slot}` | The running update proved itself |
@@ -198,6 +199,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `updates` | `auto` | `manual` reports the offer and does nothing |
 | `reboot` | `auto` | `manual` reports `reboot_requested` instead |
 | `console` | `false` | Join NervesHub's console channel |
+| `console_commands` | `[]` | The application's own console commands. See [the console](#the-console) |
 | `extensions` | none | `all`, or any of `health`, `geo`, `logging` |
 | `capture_io` | `false` | Send what the application prints |
 | `register` | none | Register the agent under a name |
@@ -209,6 +211,8 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `log_flush_ms` | 10000 | How long batched log lines wait |
 | `log_buffer` | 100 | Log lines held before the oldest are dropped |
 | `ping_interval_ms` | 60000 | WebSocket pings; the IDF on its own sends them every 10 s |
+| `download_resume_after_ms` | 10000 | How long a download connection may stay quiet before it is resumed. See [updates](#updates) |
+| `download_resumes` | 3 | Download connections in a row that bring nothing before giving up |
 | `transport` | `websocket_client` | |
 
 ## Updates
@@ -223,14 +227,28 @@ running archive is never overwritten, so a refused or corrupt download leaves
 the device running what it had.
 
 NervesHub hears how it goes as it goes: `received` when the update is accepted,
-`started` as each download attempt begins, progress while it downloads,
+`started` as each download connection begins, progress while it downloads,
 `completed` once it is armed, and `failed` with a reason if it is not.
 
-A download that drops part way is resumed from the last byte received, with a
-`Range` request, up to five more times with a growing pause between. Only a
-failure another attempt would not fix, such as a 404 or a flash write that
-failed, ends it at once. A download that goes two minutes without a byte is
-given up on, since the HTTP client has no timeout of its own.
+A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
+short is dropped, and the rest is asked for from the last byte received with a
+`Range` request. The download gives up only after `resumes` (3) connections in
+a row that brought no new byte; one that brought any starts the count again, so
+a slow link that keeps moving takes as many connections as it needs. After one
+that brought nothing it waits `resume_after_ms` times that count. A 5xx counts
+as a connection that brought nothing; a failure another connection would not
+fix, such as a 404 or a flash write that failed, ends it at once. The agent
+passes `download_resume_after_ms` and `download_resumes` from its config as
+these two. The deadline covers each connection's DNS lookup, TCP connect, TLS
+handshake and first byte as well as the reads: on a link whose handshake often
+takes longer than 10 s, raise `download_resume_after_ms`. A download the agent
+hears nothing from for `download_idle_ms` (two minutes) is given up on; a
+resume counts as hearing from it.
+
+The connection is read by a process of its own, and a quiet one is ended by
+killing that process: AtomVM's `ssl:recv/2` has no deadline and cannot be
+woken. Its socket and TLS session go with it, since AtomVM frees a process's
+resources when it dies, so the next connection does not wait for room.
 
 ### Deciding for yourself
 
@@ -331,7 +349,33 @@ which is off by default. Without it a device configured with keys reports
 `console => true` joins NervesHub's console channel. On Nerves, `nerves_hub_link`
 answers that channel with an IEx session. AtomVM has no shell, so this answers
 with a fixed set of commands instead: `help`, `info`, `firmware`, `memory`,
-`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`.
+`partitions`, `net`, `geo`, `signature`, `uptime`, `reboot`, `clear`. The up
+and down arrows walk through the last lines entered.
+
+`console_commands` adds the application's own:
+
+```erlang
+console_commands => [
+    {<<"relays">>, <<"the relay states">>, fun(_Args) -> my_app:relays() end},
+    {<<"io">>, <<"di">>, <<"the digital inputs">>, fun(Args) -> my_app:inputs(Args) end}
+]
+```
+
+`Fun` gets the line's arguments and returns the output (iodata); a line end is
+added if it has none. One that raises prints the error instead of taking the
+console down. `help` lists the commands by section: the built-in ones are in
+`device` and `network`, an application's goes in the section it names or in
+`application`. One with a built-in's name replaces it; `help` itself cannot be
+replaced. Names, sections and descriptions are binaries, and an entry that is
+not is refused at start with `{error, {invalid_console_command, Entry}}`.
+Support scripts run the built-in commands only, and `clear` prints nothing
+there.
+
+`Fun` runs in the agent's process. While it runs, the agent sends no heartbeat
+and reads no frame, so it must be quick. It must not call `nerves_hub_link`:
+those calls go to the agent and would wait on themselves until they time out.
+
+A line is at most 256 bytes; what is typed past that is not kept.
 
 It reports, and it reboots. It will not evaluate Erlang, and it is not a way in
 to a running system.
@@ -355,8 +399,9 @@ restart the device every time it connected.
 
 ## Extensions
 
-`extensions => all` attaches the three NervesHub extensions: `health` reports
-memory and uptime, `geo` reports a location, and `logging` carries log lines.
+`extensions => all` attaches the four NervesHub extensions: `health` reports
+memory and uptime, `geo` reports a location, `logging` carries log lines, and
+`alarms` sends the application's alarms as they are raised and cleared.
 
 After the device joins, NervesHub says which versions of each it speaks and the
 device joins with the newest both know. An operator can turn one off or on
@@ -395,6 +440,39 @@ leader, so `io:format/2`, `IO.puts/1` and `IO.inspect/1` reach NervesHub as well
 as the console. Read `nh_io_capture` before turning it on: the failure mode of a
 group leader is a printing process that waits forever, and there is one
 interaction with `logger_std_h` that duplicates every logged line.
+
+### Alarms
+
+`alarms => Fun` returns the complete set raised right now, `#{Name =>
+Description}`. Without the `alarms` extension it goes on the health report,
+which NervesHub asks for hourly on an idle device. With it, the agent calls
+`Fun` every `alarms_interval_ms` (30 s by default) and sends only what changed,
+stamped with the time the alarm appeared; `nh_ext_alarms` has the details.
+
+A `Fun` of one argument is given what it returned last time, as it returned
+it (`#{}` the first time), so an alarm can clear at a different level from the
+one that raised it:
+
+```erlang
+alarms => fun(Raised) ->
+    Block = erlang:system_info(esp32_largest_free_block),
+    Limit = case maps:is_key(<<"LowMemory">>, Raised) of true -> 36000; false -> 32768 end,
+    case Block < Limit of
+        true -> #{<<"LowMemory">> => <<"heap fragmented">>};
+        false -> #{}
+    end
+end
+```
+
+Keep descriptions stable: a new description is sent as the alarm raised again.
+A description may be `undefined`, and is then left out. Names and descriptions
+are sent as strings, so `low_memory` and `<<"low_memory">>` are one alarm; a
+set holding both sends only one of them.
+
+`Fun` runs in the agent's process, for every health report and every
+`alarms_interval_ms`. Keep it quick: while it runs, the agent sends no
+heartbeat and reads no frame. It must not call `nerves_hub_link`, whose calls
+go to the agent and would wait on themselves until they time out.
 
 ## Describing the firmware
 

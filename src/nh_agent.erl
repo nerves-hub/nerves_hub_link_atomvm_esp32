@@ -46,6 +46,22 @@
 %% concern would not work: a steady stream of incoming messages would keep
 %% pushing every timeout out, and a device would stop heartbeating while it
 %% looked busy and healthy.
+%%
+%% == Credentials ==
+%%
+%% `client_cert' and `shared_secret' are kept sealed in a fun from the moment
+%% the agent is started, and opened only to build the socket's options. A crash
+%% prints the state of the process, and a fun prints as `#Fun<..>' without
+%% what it closes over: the device's private key stays out of the serial log and
+%% out of the crash report. Either may be given as such a fun already, for a
+%% caller that keeps it sealed as well.
+%%
+%% == Alarms ==
+%%
+%% With the `alarms' extension enabled and an `alarms => Fun', the agent asks
+%% the application for its alarms every `alarms_interval_ms' (30 s by default)
+%% and sends what changed; see `nh_ext_alarms'. It keeps asking while offline,
+%% so an alarm raised then keeps the time it was raised.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_agent).
@@ -54,6 +70,7 @@
 
 %% Exported so a supervisor or a test can run the loop directly.
 -export([init/2, loop/1]).
+-export([seal/1]).
 
 %% What this agent tells NervesHub it speaks. 2.4.0 is the version that brings
 %% device-managed updates; below 2.1.0 NervesHub types support scripts into the
@@ -91,6 +108,10 @@
 %% has no receive timeout of its own, so without this it would wait forever.
 -define(DEFAULT_DOWNLOAD_IDLE_MS, 120000).
 -define(DEFAULT_LOG_FLUSH_MS, 10000).
+%% After a batch sent at once, the next urgent lines wait this long and go
+%% together: NervesHub takes 5 logging messages a second (bursts of 10), and a
+%% message per error line in a crash loop would lose most of them.
+-define(URGENT_LOG_GAP_MS, 250).
 -define(DEFAULT_LOG_BUFFER, 100).
 -define(DEFAULT_NETWORK_INTERFACE, <<"wlan0">>).
 -define(DEFAULT_TRIAL, #{boot_attempts => 3, join_timeout_ms => 300000}).
@@ -99,13 +120,15 @@
 %% Replies to extension pushes are matched by reference; this many are kept.
 -define(EXT_REFS_KEPT, 16).
 
+-define(DEFAULT_ALARMS_INTERVAL_MS, 30000).
+
 -type config() :: #{
     url => binary() | string(),
     host => binary() | string(),
     identifier := binary(),
     transport => module(),
-    shared_secret => {binary(), binary()},
-    client_cert => {binary(), binary()},
+    shared_secret => credentials(),
+    client_cert => credentials(),
     verify => term(),
     metadata => map(),
     handler => pid(),
@@ -117,10 +140,17 @@
     firmware_trial => #{boot_attempts => pos_integer(), join_timeout_ms => pos_integer()} | off,
     log_flush_ms => pos_integer(),
     log_buffer => pos_integer(),
-    ping_interval_ms => pos_integer()
+    ping_interval_ms => pos_integer(),
+    alarms_interval_ms => pos_integer(),
+    download_idle_ms => pos_integer(),
+    download_resume_after_ms => pos_integer(),
+    download_resumes => pos_integer()
 }.
 
--export_type([config/0]).
+%% A pair, or a fun that returns it: see Credentials in the module doc.
+-type credentials() :: {binary(), binary()} | fun(() -> {binary(), binary()}).
+
+-export_type([config/0, credentials/0]).
 
 %%-----------------------------------------------------------------------------
 %% @doc Start the agent, linked to the caller.
@@ -129,12 +159,29 @@
 -spec start_link(config()) -> {ok, pid()} | {error, term()}.
 start_link(Config) ->
     Owner = maps:get(handler, Config, self()),
-    named(spawn_link(?MODULE, init, [Config, Owner]), Config).
+    named(spawn_link(?MODULE, init, [seal(Config), Owner]), Config).
 
 -spec start(config()) -> {ok, pid()} | {error, term()}.
 start(Config) ->
     Owner = maps:get(handler, Config, self()),
-    named(spawn(?MODULE, init, [Config, Owner]), Config).
+    named(spawn(?MODULE, init, [seal(Config), Owner]), Config).
+
+%% @private Before the spawn, so that not even the new process's arguments
+%% hold them. Exported for the tests.
+seal(Config) ->
+    lists:foldl(
+        fun(Key, Acc) ->
+            case maps:find(Key, Acc) of
+                {ok, {_, _} = Pair} -> Acc#{Key := fun() -> Pair end};
+                _ -> Acc
+            end
+        end,
+        Config,
+        [client_cert, shared_secret]
+    ).
+
+unseal(Fun) when is_function(Fun, 0) -> Fun();
+unseal(Pair) -> Pair.
 
 %% `register => Name' gives the agent a name so that something configured
 %% before it existed can find it later -- `nh_logger' is the reason, since a
@@ -181,7 +228,7 @@ init(Config, Owner) ->
         updates => maps:get(updates, Config, auto),
         firmware_keys => stash_keys(maps:get(firmware_keys, Config, [])),
         reboot => maps:get(reboot, Config, auto),
-        console => nh_console:new(),
+        console => nh_console:new(maps:get(console_commands, Config, [])),
         extensions => Extensions,
         log_buffer => nh_log_buffer:new(maps:get(log_buffer, Config, ?DEFAULT_LOG_BUFFER)),
         ext_refs => [],
@@ -193,7 +240,7 @@ init(Config, Owner) ->
         timers => #{}
     },
 
-    State1 = begin_trial(State0),
+    State1 = schedule_alarms(begin_trial(State0)),
     Channel = maybe_add_extensions(
         maybe_add_console(nh_channel:new(join_params(State1)), Config), Extensions
     ),
@@ -338,10 +385,15 @@ fire(extensions_fallback, State) ->
     join_extensions(undefined, State);
 fire(log_flush, State) ->
     flush_logs(State);
+fire(urgent_log_gap, State) ->
+    urgent_flush(State);
 fire(trial_deadline, State) ->
     trial_expired(State);
 fire(update_idle, State) ->
     update_stalled(State);
+fire(poll_alarms, State) ->
+    {Extensions, Actions} = nh_extensions:poll_alarms(maps:get(extensions, State)),
+    schedule_alarms(run_extension_actions(Actions, State#{extensions => Extensions}));
 fire({request, Kind}, State) ->
     reply_request(Kind, {error, timeout}, State);
 fire({script, Ref}, State) ->
@@ -623,9 +675,25 @@ update_decision({reschedule, DelayMs, Reason}, State) ->
 
 start_update(Payload, State0) ->
     State = status_update(<<"received">>, #{}, State0),
-    Pid = nh_ota:start_update(Payload, self(), #{keys => maps:get(firmware_keys, State, [])}),
+    %% `updater' is for the tests only, which put a fake downloader in nh_ota's
+    %% place; it is not part of the documented config.
+    Updater = maps:get(updater, maps:get(config, State), nh_ota),
+    Pid = Updater:start_update(Payload, self(), download_opts(State)),
     notify(State, {update_started, Pid}),
     download_alive(State#{update => Pid}).
+
+%% `download_resume_after_ms' and `download_resumes' reach the downloader as
+%% its `resume_after_ms' and `resumes': a device on a link whose handshake
+%% often takes longer than the 10 s default raises them.
+download_opts(#{config := Config} = State) ->
+    Passed = [
+        {resume_after_ms, download_resume_after_ms},
+        {resumes, download_resumes}
+    ],
+    maps:from_list(
+        [{keys, maps:get(firmware_keys, State, [])}] ++
+            [{Opt, maps:get(Key, Config)} || {Opt, Key} <- Passed, is_map_key(Key, Config)]
+    ).
 
 %% Everything the downloader says is a sign it is still getting somewhere.
 download_alive(#{config := Config} = State) ->
@@ -650,6 +718,10 @@ updater({progress, Percent}, State) ->
             State
         )
     );
+%% The download reconnected and asked for the rest: a sign of life.
+updater({resumed, Offset}, State) ->
+    notify(State, {download_resumed, Offset}),
+    download_alive(State);
 updater({ok, Slot}, State) ->
     %% Written and armed, not yet running. Rebooting is the application's
     %% call: it may have work to finish first, and a library that restarts a
@@ -691,6 +763,12 @@ process_down(_Pid, _Reason, State) ->
 call(update_mode, From, Tag, State) ->
     reply(From, Tag, update_mode_reply(maps:get(update_mode, State))),
     State;
+%% Before the application restarts the device on purpose: what it logged on the
+%% way down is the line that says why.
+call(flush_logs, From, Tag, State) ->
+    State1 = flush_all_logs(State),
+    reply(From, Tag, ok),
+    State1;
 call(Request, From, Tag, State) ->
     Kind = request_kind(Request),
     Requests = maps:get(requests, State),
@@ -874,6 +952,15 @@ join_extensions(Advert, State0) ->
             end
     end.
 
+schedule_alarms(#{config := Config, extensions := Extensions} = State) ->
+    case nh_extensions:polls_alarms(Extensions) of
+        true ->
+            Ms = maps:get(alarms_interval_ms, Config, ?DEFAULT_ALARMS_INTERVAL_MS),
+            set_timer(poll_alarms, Ms, State);
+        false ->
+            State
+    end.
+
 run_extension_actions(Actions, State) ->
     lists:foldl(fun run_extension_action/2, State, Actions).
 
@@ -924,7 +1011,7 @@ extension_out(<<"logging:send">>, Line, State) ->
                     push_extension(nh_ext_logs:event(), Line, State);
                 batched ->
                     Buffer = nh_log_buffer:add(Line, maps:get(log_buffer, State)),
-                    maybe_flush_logs(State#{log_buffer => Buffer})
+                    maybe_flush_logs(Line, State#{log_buffer => Buffer})
             end
     end;
 extension_out(Event, Payload, State) ->
@@ -943,11 +1030,48 @@ logging_mode(State) ->
     end.
 
 %% A full batch goes now; anything less waits for the flush timer, so a chatty
-%% moment costs one message rather than one per line.
-maybe_flush_logs(State) ->
-    case nh_log_buffer:size(maps:get(log_buffer, State)) >= nh_ext_logs:max_batch() of
-        true -> flush_logs(State);
-        false -> arm_log_flush(State)
+%% moment costs one message rather than one per line. Except when the next
+%% thing may be the device going down, taking the batch with it: an error, or a
+%% download, which is when a board without PSRAM runs out of memory. Those go
+%% soon rather than at once: the first now, and what follows within
+%% `?URGENT_LOG_GAP_MS' together when the gap ends, so a burst of errors is a
+%% few messages a second rather than one per line.
+maybe_flush_logs(Line, State) ->
+    Full = nh_log_buffer:size(maps:get(log_buffer, State)) >= nh_ext_logs:max_batch(),
+    Urgent = urgent(Line) orelse is_map_key(update, State),
+    case {Full, Urgent} of
+        {true, _} -> flush_logs(State);
+        {false, true} -> urgent_flush(State);
+        {false, false} -> arm_log_flush(State)
+    end.
+
+%% Now, unless an urgent batch went less than a gap ago: then the gap's timer
+%% sends it. Nothing waiting when the gap ends leaves the next urgent line free
+%% to go at once.
+urgent_flush(#{timers := Timers} = State) ->
+    Waiting = nh_log_buffer:size(maps:get(log_buffer, State)) > 0,
+    case is_map_key(urgent_log_gap, Timers) of
+        true ->
+            State;
+        false when Waiting ->
+            set_timer(urgent_log_gap, ?URGENT_LOG_GAP_MS, flush_logs(State));
+        false ->
+            State
+    end.
+
+urgent(#{<<"level">> := Level}) ->
+    lists:member(Level, [<<"error">>, <<"critical">>, <<"alert">>, <<"emergency">>]);
+urgent(_Line) ->
+    false.
+
+%% Everything waiting, not just one batch.
+flush_all_logs(State) ->
+    Before = nh_log_buffer:size(maps:get(log_buffer, State)),
+    State1 = flush_logs(State),
+    case nh_log_buffer:size(maps:get(log_buffer, State1)) of
+        0 -> State1;
+        Before -> State1;
+        _Fewer -> flush_all_logs(State1)
     end.
 
 arm_log_flush(#{timers := Timers, config := Config} = State) ->
@@ -1009,19 +1133,52 @@ maybe_add_console(Channel, Config) ->
 
 %% Console output only goes anywhere if the channel joined, and `push/4'
 %% already refuses on a topic that has not. In pieces: see `nh_console:chunks/2'.
+%%
+%% Output longer than one piece is encoded in a process of its own. Encoding a
+%% chunk builds several times its size in garbage (every quote in a command's
+%% JSON output is escaped), and on the agent's heap, already the largest on the
+%% device, that garbage makes the heap grow: on AtomVM a heap grows into one
+%% contiguous block of its whole new size, which a device short on memory may
+%% not have (an ESP32 without PSRAM ran out of memory there). The helper's heap
+%% is only as big as the work, the frames come back as binaries off any heap,
+%% and the garbage goes with the helper.
+%%
+%% One piece or less (the echo of every keystroke, a prompt, the banner) is
+%% encoded here: its garbage fits in the room the heap already has, while a
+%% process per keystroke, each heap allocated and freed among everything else,
+%% fragmented the memory of a device without PSRAM until its largest free
+%% block was too small for a TLS handshake.
 console_out(<<>>, State) ->
     State;
 console_out(Output, State) ->
-    lists:foldl(
-        fun(Chunk, Acc) ->
-            {Channel, Actions} = nh_channel:push(
-                <<"console">>, <<"up">>, #{<<"data">> => Chunk}, maps:get(channel, Acc)
-            ),
-            run(Actions, Acc#{channel => Channel})
+    Channel0 = maps:get(channel, State),
+    Push = fun() -> push_chunks(nh_console:chunks(Output, ?CONSOLE_CHUNK), Channel0, []) end,
+    {Channel, Actions} =
+        case byte_size(Output) =< ?CONSOLE_CHUNK of
+            true -> Push();
+            false -> off_heap(Push)
         end,
-        State,
-        nh_console:chunks(Output, ?CONSOLE_CHUNK)
-    ).
+    run(Actions, State#{channel => Channel}).
+
+push_chunks([], Channel, Actions) ->
+    {Channel, lists:append(lists:reverse(Actions))};
+push_chunks([Chunk | Rest], Channel0, Actions) ->
+    {Channel, More} = nh_channel:push(
+        <<"console">>, <<"up">>, #{<<"data">> => Chunk}, Channel0
+    ),
+    push_chunks(Rest, Channel, [More | Actions]).
+
+%% Fun's result, computed in a process of its own; its exit reason if it fails.
+off_heap(Fun) ->
+    Self = self(),
+    {Pid, Monitor} = spawn_monitor(fun() -> Self ! {self(), Fun()} end),
+    receive
+        {Pid, Result} ->
+            erlang:demonitor(Monitor, [flush]),
+            Result;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            exit(Reason)
+    end.
 
 %% ------------------------------------------------------------------ helpers
 
@@ -1029,7 +1186,8 @@ console_out(Output, State) ->
 %% once the frame is handed to the socket, not once it leaves, and `esp:restart/0'
 %% is immediate -- so without a pause the platform never learns why the device
 %% vanished. The same gap swallowed the update messages on the ESP-IDF agent.
-reboot(State) ->
+reboot(State0) ->
+    State = flush_all_logs(State0),
     _ = timer:sleep(?REBOOT_GRACE_MS),
     _ =
         try
@@ -1132,7 +1290,7 @@ transport_config(Config, Url) ->
     },
 
     WithAuth =
-        case maps:get(shared_secret, Config, undefined) of
+        case unseal(maps:get(shared_secret, Config, undefined)) of
             {Key, Secret} ->
                 Identifier = maps:get(identifier, Config),
                 Base#{headers => nh_shared_secret:headers(Identifier, Key, Secret)};
@@ -1143,7 +1301,7 @@ transport_config(Config, Url) ->
     WithCert =
         case maps:get(client_cert, Config, undefined) of
             undefined -> WithAuth;
-            CertAndKey -> WithAuth#{client_cert => CertAndKey}
+            Sealed -> WithAuth#{client_cert => unseal(Sealed)}
         end,
 
     WithCert#{ping_interval_ms => maps:get(ping_interval_ms, Config, ?DEFAULT_PING_INTERVAL_MS)}.
