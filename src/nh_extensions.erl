@@ -61,7 +61,10 @@
     %% Whatever the application returns: checked on each report.
     alarms := undefined | fun(() -> term()) | fun((map()) -> term()),
     %% What the application last said was raised, and since when.
-    raised := nh_ext_alarms:raised()
+    raised := nh_ext_alarms:raised(),
+    %% What it last returned, as it returned it: what a one-argument `alarms'
+    %% is given back.
+    last := map()
 }.
 
 -export_type([state/0]).
@@ -76,8 +79,18 @@
 %% raised right now, `#{Name => Description}'. It is called for each health
 %% report and, with the `alarms' extension, every `alarms_interval_ms' (see
 %% `nh_agent'). A `Fun' of one argument is given what it returned last time,
-%% so an alarm can be cleared at a different level from the one that raised it
-%% without the application keeping state of its own.
+%% as it returned it (`#{}' the first time), so an alarm can be cleared at a
+%% different level from the one that raised it without the application keeping
+%% state of its own.
+%%
+%% Names and descriptions go out as strings: `low_memory' and `<<"low_memory">>'
+%% are the same alarm, and a set holding both sends only one of them. A
+%% description left `undefined' is left out of what is sent.
+%%
+%% `Fun' runs in the agent's process, every `alarms_interval_ms' and for each
+%% health report: it must be quick, and must not call `nerves_hub_link', whose
+%% calls go to this same process and would wait for themselves until they time
+%% out.
 %% @end
 %%-----------------------------------------------------------------------------
 -spec new(map()) -> state().
@@ -94,7 +107,8 @@ new(Config) ->
         offered => #{},
         attached => [],
         alarms => maps:get(alarms, Config, undefined),
-        raised => nh_ext_alarms:new()
+        raised => nh_ext_alarms:new(),
+        last => #{}
     }.
 
 normalise(health) -> ?HEALTH;
@@ -339,15 +353,15 @@ poll_alarms(#{raised := Raised} = State) ->
                     true -> [{push, Event, Payload} || {Event, Payload} <- Events];
                     false -> []
                 end,
-            {State#{raised => Raised1}, Pushes}
+            {State#{raised => Raised1, last => Current}, Pushes}
     end.
 
 %% A report is what you ask for when something is wrong, so an application
 %% callback that fails costs nothing: what was raised stays raised.
 alarms(#{alarms := Fun}) when is_function(Fun, 0) ->
     checked(fun() -> Fun() end);
-alarms(#{alarms := Fun, raised := Raised}) when is_function(Fun, 1) ->
-    checked(fun() -> Fun(nh_ext_alarms:current(Raised)) end);
+alarms(#{alarms := Fun, last := Last}) when is_function(Fun, 1) ->
+    checked(fun() -> Fun(Last) end);
 alarms(_State) ->
     #{}.
 

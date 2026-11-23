@@ -405,8 +405,9 @@ which NervesHub asks for hourly on an idle device. With it, the agent calls
 `Fun` every `alarms_interval_ms` (30 s by default) and sends only what changed,
 stamped with the time the alarm appeared; `nh_ext_alarms` has the details.
 
-A `Fun` of one argument is given what it returned last time, so an alarm can
-clear at a different level from the one that raised it:
+A `Fun` of one argument is given what it returned last time, as it returned
+it (`#{}` the first time), so an alarm can clear at a different level from the
+one that raised it:
 
 ```erlang
 alarms => fun(Raised) ->
@@ -420,6 +421,14 @@ end
 ```
 
 Keep descriptions stable: a new description is sent as the alarm raised again.
+A description may be `undefined`, and is then left out. Names and descriptions
+are sent as strings, so `low_memory` and `<<"low_memory">>` are one alarm; a
+set holding both sends only one of them.
+
+`Fun` runs in the agent's process, for every health report and every
+`alarms_interval_ms`. Keep it quick: while it runs, the agent sends no
+heartbeat and reads no frame. It must not call `nerves_hub_link`, whose calls
+go to the agent and would wait on themselves until they time out.
 
 ## Describing the firmware
 

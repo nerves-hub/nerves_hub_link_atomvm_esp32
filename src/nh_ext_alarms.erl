@@ -39,8 +39,8 @@
 
 -export([new/0, update/3, snapshot/1, current/1]).
 
-%% Name => {Description, RaisedAt}
--type raised() :: #{binary() => {binary(), binary() | undefined}}.
+%% Name => {Description, RaisedAt}; a description left `undefined' is not sent.
+-type raised() :: #{binary() => {binary() | undefined, binary() | undefined}}.
 
 -export_type([raised/0]).
 
@@ -58,7 +58,7 @@ new() -> #{}.
 -spec update(map(), raised(), binary() | undefined) -> {raised(), [{binary(), map()}]}.
 update(Current, Raised, Now) ->
     Wanted = maps:from_list([
-        {text(Name), text(Description)}
+        {text(Name), description(Description)}
      || {Name, Description} <- maps:to_list(Current)
     ]),
 
@@ -98,20 +98,34 @@ snapshot(Raised) ->
     }.
 
 %%-----------------------------------------------------------------------------
-%% @doc What is raised, as the application describes it: `#{Name => Description}'.
+%% @doc What is raised, for the health report: `#{Name => Description}', an
+%% empty description where the application gave none.
 %% @end
 %%-----------------------------------------------------------------------------
 -spec current(raised()) -> #{binary() => binary()}.
 current(Raised) ->
-    maps:map(fun(_Name, {Description, _At}) -> Description end, Raised).
+    maps:map(
+        fun
+            (_Name, {undefined, _At}) -> <<>>;
+            (_Name, {Description, _At}) -> Description
+        end,
+        Raised
+    ).
 
 %% ------------------------------------------------------------------- helpers
 
 raised(Name, Description, At) ->
     {<<"alarms:raised">>, entry(Name, Description, At)}.
 
+%% NervesHub treats the description as optional: none is left out, not sent as
+%% the text "undefined".
+entry(Name, undefined, At) ->
+    stamped(#{<<"alarm">> => Name}, <<"raised_at">>, At);
 entry(Name, Description, At) ->
     stamped(#{<<"alarm">> => Name, <<"description">> => Description}, <<"raised_at">>, At).
+
+description(undefined) -> undefined;
+description(Description) -> text(Description).
 
 stamped(Payload, _Key, undefined) -> Payload;
 stamped(Payload, Key, At) -> Payload#{Key => At}.

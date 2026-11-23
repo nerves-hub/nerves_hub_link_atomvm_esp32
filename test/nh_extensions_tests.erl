@@ -236,6 +236,26 @@ a_fun_of_one_is_given_the_previous_set_test() ->
      || _ <- [1, 2]
     ]).
 
+%% Given back as it returned it, not as it went out: an atom key stays an atom,
+%% or `maps:is_key(low_memory, Previous)' would never be true.
+a_fun_of_one_is_given_its_own_keys_back_test() ->
+    Self = self(),
+    Fun = fun(Previous) ->
+        Self ! {previous, Previous},
+        #{low_memory => "low"}
+    end,
+    {State, _} = nh_extensions:poll_alarms(with_alarms([alarms], Fun)),
+    {_, _} = nh_extensions:poll_alarms(State),
+    receive
+        {previous, #{}} -> ok
+    end,
+    ?assertEqual(
+        #{low_memory => "low"},
+        receive
+            {previous, P} -> P
+        end
+    ).
+
 %% What was raised stays raised: a broken callback is not a cleared alarm.
 a_failing_fun_changes_nothing_test() ->
     Key = {?MODULE, fail},

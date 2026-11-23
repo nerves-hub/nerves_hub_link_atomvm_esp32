@@ -65,6 +65,20 @@ names_and_descriptions_become_strings_test() ->
         nh_ext_alarms:current(Raised)
     ).
 
+%% The description is optional on the server: none is left out, not sent as
+%% "undefined"; the health report, a map of descriptions, gets an empty one.
+a_missing_description_is_left_out_test() ->
+    {Raised, Events} = raise(#{<<"Hot">> => undefined}),
+    ?assertEqual(
+        [{<<"alarms:raised">>, #{<<"alarm">> => <<"Hot">>, <<"raised_at">> => ?T1}}],
+        Events
+    ),
+    ?assertEqual(
+        #{<<"alarms">> => [#{<<"alarm">> => <<"Hot">>, <<"raised_at">> => ?T1}]},
+        nh_ext_alarms:snapshot(Raised)
+    ),
+    ?assertEqual(#{<<"Hot">> => <<>>}, nh_ext_alarms:current(Raised)).
+
 clears_come_before_raises_test() ->
     {Raised, _} = raise(#{<<"A">> => <<"a">>}),
     {_, Events} = nh_ext_alarms:update(#{<<"B">> => <<"b">>}, Raised, ?T2),
