@@ -7,6 +7,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- On an AtomVM with `esp32_internal_largest_free_block` and
+  `esp32_internal_minimum_free_size`, health metrics and the console's
+  `memory` add the same numbers for internal RAM only
+  (`internal_largest_free_block_bytes`, `internal_minimum_free_heap_bytes`):
+  with PSRAM in the heap, the others count megabytes of PSRAM.
 - `network_interface` may be a function, asked on each join and download,
   for a device that moves between networks without restarting the agent.
 - `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,

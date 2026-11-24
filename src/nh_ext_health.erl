@@ -27,6 +27,11 @@
 %% Those byte counts are also the numbers worth watching on an ESP32.
 %% `minimum_free_heap_bytes' is the one that finds leaks: free heap recovers
 %% after a garbage collection, the low-water mark does not.
+%%
+%% With PSRAM in the heap those three count PSRAM too, megabytes of it, while
+%% Wi-Fi, DMA and small allocations still need internal RAM. On an AtomVM that
+%% reports it, `internal_largest_free_block_bytes' and
+%% `internal_minimum_free_heap_bytes' are the same numbers for internal RAM only.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_ext_health).
@@ -75,6 +80,8 @@ metrics() ->
         {<<"free_heap_bytes">>, info(esp32_free_heap_size)},
         {<<"largest_free_block_bytes">>, info(esp32_largest_free_block)},
         {<<"minimum_free_heap_bytes">>, info(esp32_minimum_free_size)},
+        {<<"internal_largest_free_block_bytes">>, info(esp32_internal_largest_free_block)},
+        {<<"internal_minimum_free_heap_bytes">>, info(esp32_internal_minimum_free_size)},
         {<<"process_count">>, info(process_count)},
         {<<"atom_count">>, info(atom_count)},
         {<<"port_count">>, info(port_count)}

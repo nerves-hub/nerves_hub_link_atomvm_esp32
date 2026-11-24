@@ -442,7 +442,9 @@ execute(<<"memory">>, _Args) ->
         {<<"atoms">>, integer(info(atom_count))},
         {<<"free heap">>, integer(info(esp32_free_heap_size))},
         {<<"largest block">>, integer(info(esp32_largest_free_block))},
-        {<<"min free heap">>, integer(info(esp32_minimum_free_size))}
+        {<<"min free heap">>, integer(info(esp32_minimum_free_size))},
+        {<<"int. largest">>, integer(info(esp32_internal_largest_free_block))},
+        {<<"int. min free">>, integer(info(esp32_internal_minimum_free_size))}
     ]);
 execute(<<"partitions">>, _Args) ->
     case safe(fun() -> apply(esp, partition_list, []) end) of
