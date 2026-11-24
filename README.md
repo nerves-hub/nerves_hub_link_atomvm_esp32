@@ -205,6 +205,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `console` | `false` | Join NervesHub's console channel |
 | `console_commands` | `[]` | The application's own console commands. See [the console](#the-console) |
 | `extensions` | none | `all`, or any of `health`, `geo`, `logging` |
+| `location` | none | `geo`'s answer, a function returning the payload (or `undefined`) instead of a GeoIP lookup |
 | `capture_io` | `false` | Send what the application prints |
 | `register` | none | Register the agent under a name |
 | `handler` | the caller | Where `{nerves_hub, Event}` goes |

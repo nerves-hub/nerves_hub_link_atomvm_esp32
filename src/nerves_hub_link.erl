@@ -259,6 +259,7 @@
     console_commands => [nh_console:command()],
     extensions => all | [health | geo | logging | alarms],
     alarms => fun(() -> #{binary() => binary()}) | fun((map()) -> #{binary() => binary()}),
+    location => fun(() -> map() | undefined),
     reboot => auto | manual,
     updates => auto | manual,
     firmware_keys => [binary() | string()],

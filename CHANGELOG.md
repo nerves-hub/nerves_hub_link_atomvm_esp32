@@ -7,6 +7,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `location => Fun` answers the `geo` extension's request with what the
+  application knows (a GPS fix, say) instead of a GeoIP lookup: no second TLS
+  session. `undefined` (no fix yet) sends nothing, so NervesHub's page still
+  offers to set the location by hand.
 - `network_interface` may be a function, asked on each join and download,
   for a device that moves between networks without restarting the agent.
 - `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,

@@ -19,6 +19,18 @@
 %% `#{error_code, error_description}', because a device that answers nothing
 %% and a device that cannot resolve look identical from the platform.
 %%
+%% == A source of its own ==
+%%
+%% A device that knows better than its IP address — a GPS, a configured
+%% position — passes `location => Fun' to the agent. `Fun()' returns the
+%% payload to send, `#{<<"source">> => <<"gps">>, <<"latitude">> => ..,
+%% <<"longitude">> => ..}', or `undefined' while it has none, and the lookup
+%% is not made at all: no second TLS session, no request to the service.
+%%
+%% `undefined' sends nothing. NervesHub's device page offers to set the
+%% location by hand only when it has none, and an error in its place hides
+%% that: a device without a fix is better left blank than reported.
+%%
 %% == Running it ==
 %%
 %% `resolve/0' makes a network request and blocks until it finishes, so it must
@@ -28,7 +40,16 @@
 %%-----------------------------------------------------------------------------
 -module(nh_ext_geo).
 
--export([start_resolve/1, resolve/0, resolve/1, event/0, default_url/0, parse_response/1]).
+-export([
+    start_resolve/1,
+    start_resolve/2,
+    resolve/0,
+    resolve/1,
+    located/1,
+    event/0,
+    default_url/0,
+    parse_response/1
+]).
 
 -define(DEFAULT_URL, <<"https://whenwhere.nerves-project.org/">>).
 -define(TIMEOUT, 15000).
@@ -44,12 +65,42 @@ event() -> <<"geo:location:update">>.
 default_url() -> ?DEFAULT_URL.
 
 %%-----------------------------------------------------------------------------
-%% @doc Resolve in a separate process, sending `{nh_ext_geo, Pid, Location}'.
+%% @doc Resolve in a separate process, sending `{nh_ext_geo, Pid, Location}',
+%% where `Location' is `undefined' when there is nothing to send.
 %% @end
 %%-----------------------------------------------------------------------------
 -spec start_resolve(pid()) -> pid().
 start_resolve(Owner) ->
-    spawn(fun() -> Owner ! {nh_ext_geo, self(), resolve()} end).
+    start_resolve(Owner, undefined).
+
+%%-----------------------------------------------------------------------------
+%% @doc Resolve from `Source', the application's `location' fun, or by GeoIP
+%% when there is none.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec start_resolve(pid(), undefined | fun(() -> map() | undefined)) -> pid().
+start_resolve(Owner, undefined) ->
+    spawn(fun() -> Owner ! {nh_ext_geo, self(), resolve()} end);
+start_resolve(Owner, Source) when is_function(Source, 0) ->
+    spawn(fun() -> Owner ! {nh_ext_geo, self(), located(Source)} end).
+
+%%-----------------------------------------------------------------------------
+%% @doc The payload for what the application's `location' fun returns.
+%%
+%% `undefined' — no fix yet — stays `undefined', and nothing is sent: the
+%% page keeps offering to set the location by hand. A fun that raises is a
+%% bug rather than a missing fix, and is reported as `SOURCE_ERROR'.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec located(fun(() -> map() | undefined)) -> map() | undefined.
+located(Source) ->
+    try Source() of
+        Location when is_map(Location) -> Location;
+        undefined -> undefined;
+        Other -> error_payload(<<"SOURCE_ERROR">>, {bad_location, Other})
+    catch
+        Class:Reason -> error_payload(<<"SOURCE_ERROR">>, {Class, Reason})
+    end.
 
 %%-----------------------------------------------------------------------------
 %% @equiv resolve(default_url())
