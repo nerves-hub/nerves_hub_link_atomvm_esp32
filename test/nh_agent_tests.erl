@@ -1939,6 +1939,30 @@ declining_an_update_tells_nervesHub_test() ->
 
     nh_agent:stop(Agent).
 
+%% nerves_hub_link sends no reschedule shorter than 5 minutes, and nor does
+%% this agent.
+a_reschedule_is_never_shorter_than_five_minutes_test() ->
+    {Agent, _JoinRef} = join_device(#{updates => manual}),
+
+    lists:foreach(
+        fun({Asked, Sent}) ->
+            ok = nerves_hub_link:reschedule_update(Agent, Asked, <<"busy">>),
+            ?assertEqual(
+                {Asked, #{
+                    <<"status">> => <<"rescheduled">>,
+                    <<"delay_for">> => Sent,
+                    <<"reason">> => <<"busy">>
+                }},
+                {Asked, wait_for_event(<<"status_update">>, 1000)}
+            )
+        end,
+        [{0, 5}, {1, 5}, {4, 5}, {5, 5}]
+    ),
+
+    ?assertError(function_clause, nerves_hub_link:reschedule_update(Agent, -1, <<"busy">>)),
+
+    nh_agent:stop(Agent).
+
 %% ------------------------------------------------------- extension lifecycle
 
 an_operator_can_detach_and_reattach_an_extension_test() ->
