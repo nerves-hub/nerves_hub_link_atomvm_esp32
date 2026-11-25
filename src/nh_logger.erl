@@ -118,7 +118,21 @@ forward(Agent, Event) ->
             %% Before the clock is set there is no honest timestamp, and
             %% NervesHub drops a line without one anyway.
             ok
-    end.
+    end,
+    report(Agent, Level, Event).
+
+%% A crash is also an error report. The agent drops it unless the
+%% `error_reports' extension is enabled.
+report(Agent, <<"error">>, Event) ->
+    case nh_ext_error_reports:from_log(Event) of
+        {ok, Report} ->
+            Agent ! {push_extension, nh_ext_error_reports:event(), Report},
+            ok;
+        ignore ->
+            ok
+    end;
+report(_Agent, _Level, _Event) ->
+    ok.
 
 agent(Config) ->
     case maps:get(agent, Config, ?DEFAULT_AGENT) of

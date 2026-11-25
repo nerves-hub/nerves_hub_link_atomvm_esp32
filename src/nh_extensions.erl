@@ -3,7 +3,7 @@
 %
 
 %%-----------------------------------------------------------------------------
-%% @doc The extensions channel: health, geo, logs and alarms.
+%% @doc The extensions channel: health, geo, logs, alarms and error reports.
 %%
 %% Extensions are optional capabilities a device offers and the platform turns
 %% on. After the device joins, NervesHub advertises the extensions it knows and
@@ -50,6 +50,7 @@
 -export([handle_event/3, scope/1, polls_alarms/1, poll_alarms/1]).
 
 -define(ALARMS, <<"alarms">>).
+-define(ERROR_REPORTS, <<"error_reports">>).
 -define(GEO, <<"geo">>).
 -define(HEALTH, <<"health">>).
 -define(LOGGING, <<"logging">>).
@@ -72,7 +73,7 @@
 %%-----------------------------------------------------------------------------
 %% @doc Build the registry from configuration.
 %%
-%% `extensions => [health, geo, logging, alarms]', or `all'. Nothing is
+%% `extensions => [health, geo, logging, alarms, error_reports]', or `all'. Nothing is
 %% enabled by default: each one costs traffic a device may not want to spend.
 %%
 %% `alarms => Fun' gives the application's alarms: it returns the complete set
@@ -97,7 +98,7 @@
 new(Config) ->
     Enabled =
         case maps:get(extensions, Config, []) of
-            all -> [?HEALTH, ?GEO, ?LOGGING, ?ALARMS];
+            all -> [?HEALTH, ?GEO, ?LOGGING, ?ALARMS, ?ERROR_REPORTS];
             List when is_list(List) -> [normalise(E) || E <- List];
             _ -> []
         end,
@@ -116,7 +117,9 @@ normalise(geo) -> ?GEO;
 normalise(logging) -> ?LOGGING;
 normalise(logs) -> ?LOGGING;
 normalise(alarms) -> ?ALARMS;
+normalise(error_reports) -> ?ERROR_REPORTS;
 normalise(?ALARMS) -> ?ALARMS;
+normalise(?ERROR_REPORTS) -> ?ERROR_REPORTS;
 normalise(?HEALTH) -> ?HEALTH;
 normalise(?GEO) -> ?GEO;
 normalise(?LOGGING) -> ?LOGGING;
@@ -125,8 +128,10 @@ normalise(_Other) -> undefined.
 %% What this library speaks of each, newest first. Claiming a version is
 %% claiming a wire format, so these track `nerves_hub_link' rather than this
 %% library. Logging 0.1.0 is the batched format: `#{<<"lines">> => [...]}'.
-%% `alarms' arrived after the others, at its own version.
+%% `alarms' and `error_reports' arrived after the others, at their own
+%% versions; `error_reports' was batched from the start and has no 0.0.1.
 local_versions(?ALARMS) -> [<<"0.1.0">>];
+local_versions(?ERROR_REPORTS) -> [<<"0.1.0">>];
 local_versions(?LOGGING) -> [<<"0.1.0">>, <<"0.0.1">>];
 local_versions(_Name) -> [<<"0.0.1">>].
 

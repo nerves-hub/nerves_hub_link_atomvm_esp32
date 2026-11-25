@@ -33,7 +33,14 @@
 -module(nh_ext_logs).
 
 -export([
-    line/2, line/3, line_at/4, event/0, batch/1, dropped_line/1, max_batch/0, max_batch_bytes/0
+    line/2, line/3,
+    line_at/4,
+    event/0,
+    batch/1,
+    dropped_line/1,
+    max_batch/0,
+    max_batch_bytes/0,
+    truncate/2
 ]).
 
 %% Anything below the epoch-plus-a-few-decades is a clock that was never set.
@@ -154,9 +161,17 @@ micros() ->
 
 %% Cut on a character boundary: half a UTF-8 sequence is not a string, and the
 %% JSON encoder refuses the whole message over it.
-truncate(Message) when is_binary(Message), byte_size(Message) > ?MAX_MESSAGE_BYTES ->
-    <<(binary:part(Message, 0, boundary(Message, ?MAX_MESSAGE_BYTES)))/binary, "...">>;
-truncate(Message) ->
+truncate(Message) -> truncate(Message, ?MAX_MESSAGE_BYTES).
+
+%%-----------------------------------------------------------------------------
+%% @doc `Message' cut to about `Max' bytes on a character boundary, with `...'
+%% when anything was cut.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec truncate(binary(), pos_integer()) -> binary().
+truncate(Message, Max) when is_binary(Message), byte_size(Message) > Max ->
+    <<(binary:part(Message, 0, boundary(Message, Max)))/binary, "...">>;
+truncate(Message, _Max) ->
     Message.
 
 %% Back up past continuation bytes (2#10xxxxxx) to the start of a character.
