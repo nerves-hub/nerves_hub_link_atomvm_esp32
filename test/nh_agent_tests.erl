@@ -223,6 +223,17 @@ passes_the_ping_interval_to_the_transport_test() ->
     ?assertEqual(15000, maps:get(ping_interval_ms, next_opened())),
     nh_agent:stop(Agent).
 
+%% NervesHub names the library from the User-Agent (`<name>/<version>`), and
+%% the version written in the agent has to be the one the app file says.
+names_itself_to_the_transport_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(config(#{})),
+    UserAgent = maps:get(user_agent, next_opened()),
+    nh_agent:stop(Agent),
+    {ok, [{application, _, App}]} = file:consult("src/nerves_hub_link_atomvm_esp32.app.src"),
+    Vsn = list_to_binary(proplists:get_value(vsn, App)),
+    ?assertEqual(<<"nerves_hub_link_atomvm_esp32/", Vsn/binary>>, UserAgent).
+
 %% ------------------------------------------------------------------- helpers
 
 next_opened() ->

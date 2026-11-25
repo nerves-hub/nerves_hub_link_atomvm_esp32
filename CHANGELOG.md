@@ -7,6 +7,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The WebSocket upgrade names the library in its `User-Agent`
+  (`nerves_hub_link_atomvm_esp32/<version>`), so NervesHub records the client
+  library of each connection. It takes an atomvm_websocket_client with the
+  `user_agent` option; an older one ignores it and sends its default.
 - `network_interface` may be a function, asked on each join and download,
   for a device that moves between networks without restarting the agent.
 - `ping_interval_ms => Ms` sets how often the socket sends WebSocket pings,
