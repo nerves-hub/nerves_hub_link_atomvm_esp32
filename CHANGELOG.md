@@ -7,6 +7,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- On an AtomVM with `esp32_internal_largest_free_block` and
+  `esp32_internal_minimum_free_size`, health metrics and the console's
+  `memory` add the same numbers for internal RAM only
+  (`internal_largest_free_block_bytes`, `internal_minimum_free_heap_bytes`):
+  with PSRAM in the heap, the others count megabytes of PSRAM.
 - The WebSocket upgrade names the library in its `User-Agent`
   (`nerves_hub_link_atomvm_esp32/<version>`), so NervesHub records the client
   library of each connection. It takes an atomvm_websocket_client with the
