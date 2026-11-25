@@ -95,6 +95,12 @@
 %% default, the oldest dropped first and the drop reported) and sent in a batch
 %% at most once a second, NervesHub's rate; see `nh_ext_error_reports'. Held
 %% through a disconnect, they go when the extension is attached again.
+%%
+%% == Geo ==
+%%
+%% With the `geo' extension enabled, NervesHub asks where the device is. With a
+%% `location => Fun', the answer is what `Fun()' returns; without one, a GeoIP
+%% lookup; see `nh_ext_geo'.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_agent).
@@ -115,6 +121,13 @@
 %% The console version gates file transfer in NervesHub's UI, from 2.0.0. This
 %% console declines file transfer, so it does not claim to take it.
 -define(CONSOLE_VERSION, <<"1.0.0">>).
+
+%% NervesHub records the client library and its version from the User-Agent of
+%% the websocket upgrade. AtomVM has no application controller to read `vsn'
+%% from at run time, so it is repeated here; a test keeps it equal to the
+%% `.app.src'.
+-define(LIBRARY_VERSION, <<"0.2.0">>).
+-define(USER_AGENT, <<"nerves_hub_link_atomvm_esp32/", ?LIBRARY_VERSION/binary>>).
 
 -define(EXTENSIONS, <<"extensions">>).
 -define(LOGGING, <<"logging">>).
@@ -347,6 +360,8 @@ loop(State) ->
     receive
         {websocket, Handle, Event} ->
             loop(socket_event(Handle, Event, State));
+        {nh_ext_geo, _Pid, undefined} ->
+            loop(State);
         {nh_ext_geo, _Pid, Location} ->
             loop(push_extension(nh_ext_geo:event(), Location, State));
         {nh_ota, Pid, Message} ->
@@ -838,8 +853,12 @@ update_decision({apply, Payload}, State) ->
     start_update(Payload, State);
 update_decision({ignore, Reason}, State) ->
     status_update(<<"ignored">>, #{<<"reason">> => Reason}, State);
-update_decision({reschedule, DelayMs, Reason}, State) ->
-    status_update(<<"rescheduled">>, #{<<"delay_for">> => DelayMs, <<"reason">> => Reason}, State).
+%% `delay_for' is in minutes, as NervesHub's docs give it and nerves_hub_link
+%% sends it.
+update_decision({reschedule, DelayMinutes, Reason}, State) ->
+    status_update(
+        <<"rescheduled">>, #{<<"delay_for">> => DelayMinutes, <<"reason">> => Reason}, State
+    ).
 
 %% A rejoin still waiting out the backoff of an earlier failure is for that
 %% failure: firing in the middle of this download, it would close a socket
@@ -1332,8 +1351,8 @@ run_extension_actions(Actions, State) ->
 
 run_extension_action({push, Event, Payload}, State) ->
     push_extension(Event, Payload, State);
-run_extension_action({resolve_location}, State) ->
-    _ = nh_ext_geo:start_resolve(self()),
+run_extension_action({resolve_location}, #{config := Config} = State) ->
+    _ = nh_ext_geo:start_resolve(self(), maps:get(location, Config, undefined)),
     State;
 run_extension_action(Other, State) ->
     notify(State, Other),
@@ -1714,4 +1733,9 @@ transport_config(Config, Url) ->
             Sealed -> WithAuth#{client_cert => unseal(Sealed)}
         end,
 
-    WithCert#{ping_interval_ms => maps:get(ping_interval_ms, Config, ?DEFAULT_PING_INTERVAL_MS)}.
+    %% `user_agent', not a header: ESP-IDF writes its own User-Agent line first,
+    %% and NervesHub reads the first. A transport without the option ignores it.
+    WithCert#{
+        ping_interval_ms => maps:get(ping_interval_ms, Config, ?DEFAULT_PING_INTERVAL_MS),
+        user_agent => ?USER_AGENT
+    }.

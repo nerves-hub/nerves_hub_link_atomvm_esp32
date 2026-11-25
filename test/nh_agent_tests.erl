@@ -223,6 +223,17 @@ passes_the_ping_interval_to_the_transport_test() ->
     ?assertEqual(15000, maps:get(ping_interval_ms, next_opened())),
     nh_agent:stop(Agent).
 
+%% NervesHub names the library from the User-Agent (`<name>/<version>`), and
+%% the version written in the agent has to be the one the app file says.
+names_itself_to_the_transport_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(config(#{})),
+    UserAgent = maps:get(user_agent, next_opened()),
+    nh_agent:stop(Agent),
+    {ok, [{application, _, App}]} = file:consult("src/nerves_hub_link_atomvm_esp32.app.src"),
+    Vsn = list_to_binary(proplists:get_value(vsn, App)),
+    ?assertEqual(<<"nerves_hub_link_atomvm_esp32/", Vsn/binary>>, UserAgent).
+
 %% ------------------------------------------------------------------- helpers
 
 next_opened() ->
@@ -1919,9 +1930,10 @@ declining_an_update_tells_nervesHub_test() ->
         wait_for_event(<<"status_update">>, 1000)
     ),
 
-    ok = nerves_hub_link:reschedule_update(Agent, 60000, <<"busy">>),
+    %% Minutes, the unit NervesHub's docs give for `delay_for'.
+    ok = nerves_hub_link:reschedule_update(Agent, 15, <<"busy">>),
     ?assertEqual(
-        #{<<"status">> => <<"rescheduled">>, <<"delay_for">> => 60000, <<"reason">> => <<"busy">>},
+        #{<<"status">> => <<"rescheduled">>, <<"delay_for">> => 15, <<"reason">> => <<"busy">>},
         wait_for_event(<<"status_update">>, 1000)
     ),
 

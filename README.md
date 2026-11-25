@@ -205,6 +205,7 @@ connecting or every signature is decades stale. `start/1` refuses with
 | `console` | `false` | Join NervesHub's console channel |
 | `console_commands` | `[]` | The application's own console commands. See [the console](#the-console) |
 | `extensions` | none | `all`, or any of `health`, `geo`, `logging` |
+| `location` | none | `geo`'s answer, a function returning the payload (or `undefined`) instead of a GeoIP lookup |
 | `capture_io` | `false` | Send what the application prints |
 | `register` | none | Register the agent under a name |
 | `handler` | the caller | Where `{nerves_hub, Event}` goes |
@@ -311,11 +312,12 @@ waits. Answer it with one of:
 ```erlang
 nerves_hub_link:apply_update(Pid, Payload),
 nerves_hub_link:ignore_update(Pid, <<"on battery">>),
-nerves_hub_link:reschedule_update(Pid, 3600000, <<"in use">>).
+nerves_hub_link:reschedule_update(Pid, 60, <<"in use">>).
 ```
 
 Ignoring holds further offers back for the deployment's penalty timeout, and
-rescheduling asks for the same offer again after the delay.
+rescheduling asks for the same offer again after the delay, in whole minutes
+(at least 1).
 
 ### Device-managed updates
 
