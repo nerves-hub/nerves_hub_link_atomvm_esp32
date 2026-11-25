@@ -51,3 +51,29 @@ the_default_is_the_nerves_project_service_test() ->
     ?assertMatch(
         {_, _}, binary:match(nh_ext_geo:default_url(), <<"whenwhere.nerves-project.org">>)
     ).
+
+%% A GPS, say: what the application returns is what NervesHub gets.
+a_location_fun_answers_without_a_lookup_test() ->
+    Fix = #{<<"source">> => <<"gps">>, <<"latitude">> => -22.9163, <<"longitude">> => -47.0453},
+    ?assertEqual(Fix, nh_ext_geo:located(fun() -> Fix end)).
+
+%% Nothing to send: NervesHub's page then offers to set the location by hand,
+%% which it does not over an error.
+a_location_fun_without_a_fix_sends_nothing_test() ->
+    ?assertEqual(undefined, nh_ext_geo:located(fun() -> undefined end)).
+
+a_location_fun_that_raises_is_reported_test() ->
+    Location = nh_ext_geo:located(fun() -> error(gone) end),
+    ?assertEqual(<<"SOURCE_ERROR">>, maps:get(<<"error_code">>, Location)).
+
+a_location_fun_returning_something_else_is_reported_test() ->
+    Location = nh_ext_geo:located(fun() -> north end),
+    ?assertEqual(<<"SOURCE_ERROR">>, maps:get(<<"error_code">>, Location)).
+
+the_resolver_sends_the_fun_s_answer_back_test() ->
+    Fix = #{<<"source">> => <<"gps">>, <<"latitude">> => 1.0, <<"longitude">> => 2.0},
+    Pid = nh_ext_geo:start_resolve(self(), fun() -> Fix end),
+    receive
+        {nh_ext_geo, Pid, Location} -> ?assertEqual(Fix, Location)
+    after 1000 -> ?assert(false)
+    end.

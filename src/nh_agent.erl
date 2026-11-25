@@ -87,6 +87,12 @@
 %% ignored with `{update_ignored, armed}' to the owner, `apply_update/2' with
 %% `{update_decision_ignored, armed}', and `request_update/1' is answered
 %% `{error, armed}'.
+%%
+%% == Geo ==
+%%
+%% With the `geo' extension enabled, NervesHub asks where the device is. With a
+%% `location => Fun', the answer is what `Fun()' returns; without one, a GeoIP
+%% lookup; see `nh_ext_geo'.
 %% @end
 %%-----------------------------------------------------------------------------
 -module(nh_agent).
@@ -334,6 +340,8 @@ loop(State) ->
     receive
         {websocket, Handle, Event} ->
             loop(socket_event(Handle, Event, State));
+        {nh_ext_geo, _Pid, undefined} ->
+            loop(State);
         {nh_ext_geo, _Pid, Location} ->
             loop(push_extension(nh_ext_geo:event(), Location, State));
         {nh_ota, Pid, Message} ->
@@ -1321,8 +1329,8 @@ run_extension_actions(Actions, State) ->
 
 run_extension_action({push, Event, Payload}, State) ->
     push_extension(Event, Payload, State);
-run_extension_action({resolve_location}, State) ->
-    _ = nh_ext_geo:start_resolve(self()),
+run_extension_action({resolve_location}, #{config := Config} = State) ->
+    _ = nh_ext_geo:start_resolve(self(), maps:get(location, Config, undefined)),
     State;
 run_extension_action(Other, State) ->
     notify(State, Other),

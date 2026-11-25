@@ -7,6 +7,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `location => Fun` answers the `geo` extension's request with what the
+  application knows (a GPS fix, say) instead of a GeoIP lookup: no second TLS
+  session. `undefined` (no fix yet) sends nothing, so NervesHub's page still
+  offers to set the location by hand.
 - On an AtomVM with `esp32_internal_largest_free_block` and
   `esp32_internal_minimum_free_size`, health metrics and the console's
   `memory` add the same numbers for internal RAM only
