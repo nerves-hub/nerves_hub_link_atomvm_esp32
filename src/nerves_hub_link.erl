@@ -482,15 +482,16 @@ ignore_update(Pid, Reason) when is_binary(Reason) ->
 
 %%-----------------------------------------------------------------------------
 %% @doc Not now: ask NervesHub to offer the update again in `DelayMinutes',
-%% a whole number of minutes, at least 1.
+%% a whole number of minutes.
 %%
 %% Minutes, not milliseconds: NervesHub's docs give `delay_for' in minutes,
-%% and nerves_hub_link sends it that way.
+%% and nerves_hub_link sends it that way. A delay under 5 minutes is sent as
+%% 5, which is the minimum nerves_hub_link sends.
 %% @end
 %%-----------------------------------------------------------------------------
--spec reschedule_update(pid(), pos_integer(), binary()) -> ok.
+-spec reschedule_update(pid(), non_neg_integer(), binary()) -> ok.
 reschedule_update(Pid, DelayMinutes, Reason) when
-    is_integer(DelayMinutes), DelayMinutes >= 1, is_binary(Reason)
+    is_integer(DelayMinutes), DelayMinutes >= 0, is_binary(Reason)
 ->
     Pid ! {update_decision, {reschedule, DelayMinutes, Reason}},
     ok.

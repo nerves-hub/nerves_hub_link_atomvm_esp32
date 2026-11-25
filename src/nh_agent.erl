@@ -152,6 +152,9 @@
 -define(EXTENSIONS_FALLBACK_MS, 5000).
 %% What NervesHub gives a device-initiated request before it gives up.
 -define(REQUEST_TIMEOUT_MS, 30000).
+%% The shortest reschedule sent to NervesHub: a shorter delay is sent as this,
+%% as nerves_hub_link does.
+-define(MIN_RESCHEDULE_MINUTES, 5).
 %% A download that has said nothing for this long has stalled: `ahttp_client'
 %% has no receive timeout of its own, so without this it would wait forever.
 -define(DEFAULT_DOWNLOAD_IDLE_MS, 120000).
@@ -854,10 +857,11 @@ update_decision({apply, Payload}, State) ->
 update_decision({ignore, Reason}, State) ->
     status_update(<<"ignored">>, #{<<"reason">> => Reason}, State);
 %% `delay_for' is in minutes, as NervesHub's docs give it and nerves_hub_link
-%% sends it.
+%% sends it, and at least `?MIN_RESCHEDULE_MINUTES'.
 update_decision({reschedule, DelayMinutes, Reason}, State) ->
+    DelayFor = max(DelayMinutes, ?MIN_RESCHEDULE_MINUTES),
     status_update(
-        <<"rescheduled">>, #{<<"delay_for">> => DelayMinutes, <<"reason">> => Reason}, State
+        <<"rescheduled">>, #{<<"delay_for">> => DelayFor, <<"reason">> => Reason}, State
     ).
 
 %% A rejoin still waiting out the backoff of an earlier failure is for that

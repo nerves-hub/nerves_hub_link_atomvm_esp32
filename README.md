@@ -316,8 +316,8 @@ nerves_hub_link:reschedule_update(Pid, 60, <<"in use">>).
 ```
 
 Ignoring holds further offers back for the deployment's penalty timeout, and
-rescheduling asks for the same offer again after the delay, in whole minutes
-(at least 1).
+rescheduling asks for the same offer again after the delay, in whole minutes.
+A delay under 5 minutes is sent as 5, as nerves_hub_link does.
 
 ### Device-managed updates
 
