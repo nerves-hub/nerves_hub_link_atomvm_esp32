@@ -1831,9 +1831,10 @@ declining_an_update_tells_nervesHub_test() ->
         wait_for_event(<<"status_update">>, 1000)
     ),
 
-    ok = nerves_hub_link:reschedule_update(Agent, 60000, <<"busy">>),
+    %% Minutes, the unit NervesHub's docs give for `delay_for'.
+    ok = nerves_hub_link:reschedule_update(Agent, 15, <<"busy">>),
     ?assertEqual(
-        #{<<"status">> => <<"rescheduled">>, <<"delay_for">> => 60000, <<"reason">> => <<"busy">>},
+        #{<<"status">> => <<"rescheduled">>, <<"delay_for">> => 15, <<"reason">> => <<"busy">>},
         wait_for_event(<<"status_update">>, 1000)
     ),
 
