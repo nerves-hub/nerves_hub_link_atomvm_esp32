@@ -108,6 +108,13 @@
 %% console declines file transfer, so it does not claim to take it.
 -define(CONSOLE_VERSION, <<"1.0.0">>).
 
+%% NervesHub records the client library and its version from the User-Agent of
+%% the websocket upgrade. AtomVM has no application controller to read `vsn'
+%% from at run time, so it is repeated here; a test keeps it equal to the
+%% `.app.src'.
+-define(LIBRARY_VERSION, <<"0.2.0">>).
+-define(USER_AGENT, <<"nerves_hub_link_atomvm_esp32/", ?LIBRARY_VERSION/binary>>).
+
 -define(EXTENSIONS, <<"extensions">>).
 -define(LOGGING, <<"logging">>).
 
@@ -1652,4 +1659,9 @@ transport_config(Config, Url) ->
             Sealed -> WithAuth#{client_cert => unseal(Sealed)}
         end,
 
-    WithCert#{ping_interval_ms => maps:get(ping_interval_ms, Config, ?DEFAULT_PING_INTERVAL_MS)}.
+    %% `user_agent', not a header: ESP-IDF writes its own User-Agent line first,
+    %% and NervesHub reads the first. A transport without the option ignores it.
+    WithCert#{
+        ping_interval_ms => maps:get(ping_interval_ms, Config, ?DEFAULT_PING_INTERVAL_MS),
+        user_agent => ?USER_AGENT
+    }.
