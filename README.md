@@ -311,11 +311,12 @@ waits. Answer it with one of:
 ```erlang
 nerves_hub_link:apply_update(Pid, Payload),
 nerves_hub_link:ignore_update(Pid, <<"on battery">>),
-nerves_hub_link:reschedule_update(Pid, 3600000, <<"in use">>).
+nerves_hub_link:reschedule_update(Pid, 60, <<"in use">>).
 ```
 
 Ignoring holds further offers back for the deployment's penalty timeout, and
-rescheduling asks for the same offer again after the delay.
+rescheduling asks for the same offer again after the delay, in whole minutes
+(at least 1).
 
 ### Device-managed updates
 
