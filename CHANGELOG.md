@@ -54,6 +54,18 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking:** `reschedule_update/3` takes its delay in whole minutes (at
+  least 1), not milliseconds, and the agent sends `delay_for` to NervesHub in
+  minutes. That is the unit NervesHub's docs give and nerves_hub_link has
+  always sent; this library sent milliseconds, which NervesHub read as
+  milliseconds too, so a reschedule lasted a moment rather than the delay
+  asked for. An application that passes a delay has to divide it by 60,000:
+  `reschedule_update(Pid, 3600000, Reason)` becomes
+  `reschedule_update(Pid, 60, Reason)`. Release this before NervesHub's change
+  to read `delay_for` as minutes deploys. A device still sending milliseconds
+  to that NervesHub would be held back a thousand times longer than it asked
+  (an hour becomes 41 days), while a device sending minutes to the NervesHub
+  of today is only offered the update again sooner than it asked.
 - The socket pings once a minute by default, not every 10 seconds as
   ESP-IDF does on its own. On a metered link (a cellular modem, say) the pings
   cost more than the heartbeats, and NervesHub needs only the
