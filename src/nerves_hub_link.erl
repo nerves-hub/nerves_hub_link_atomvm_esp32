@@ -209,6 +209,14 @@
 %% socket stays open. See `nh_agent'. `before_update => Fun' runs first, to
 %% free memory for the download (the application's own TLS connections, say).
 %%
+%% While an update is in flight, the join says so (`currently_downloading_uuid'),
+%% so a socket closed for the download and opened again does not end it as
+%% abandoned. `resume_update => Payload' is an offer kept from before a restart
+%% (the `Payload' of `{message, <<"update">>, Payload}'): the first join says the
+%% device is downloading it, and the download starts once joined. NervesHub does
+%% not offer an update again while it is in flight, so this is how a device that
+%% restarts to download (with only the agent running, say) gets it.
+%%
 %% == Firmware description ==
 %%
 %% `firmware' says where the running firmware's description comes from:
@@ -282,6 +290,7 @@
     download_resumes => pos_integer(),
     keep_open_above => non_neg_integer() | never,
     before_update => fun(() -> ok),
+    resume_update => map(),
     update_retry_backoff => {pos_integer(), pos_integer()},
     transport => module()
 }.

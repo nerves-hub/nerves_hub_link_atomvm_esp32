@@ -325,7 +325,7 @@ init(Config, Owner) ->
         timers => #{}
     },
 
-    State1 = schedule_alarms(armed_or_trial(State0)),
+    State1 = schedule_alarms(armed_or_trial(resume(Config, State0))),
     Channel = maybe_add_extensions(
         maybe_add_console(nh_channel:new(join_params(State1)), Config), Extensions
     ),
@@ -566,15 +566,17 @@ handle_event({joined, <<"device">>, Response}, State) ->
     State2 = push_event(
         <<"report_network_interface">>, #{<<"interface">> => network_interface(State1)}, State1
     ),
-    case nh_extensions:enabled(maps:get(extensions, State2)) of
-        [] ->
-            State2;
-        _Some ->
-            Wait = maps:get(
-                extensions_fallback_ms, maps:get(config, State2), ?EXTENSIONS_FALLBACK_MS
-            ),
-            set_timer(extensions_fallback, Wait, State2)
-    end;
+    State3 =
+        case nh_extensions:enabled(maps:get(extensions, State2)) of
+            [] ->
+                State2;
+            _Some ->
+                Wait = maps:get(
+                    extensions_fallback_ms, maps:get(config, State2), ?EXTENSIONS_FALLBACK_MS
+                ),
+                set_timer(extensions_fallback, Wait, State2)
+        end,
+    start_resumed(State3);
 handle_event({joined, ?EXTENSIONS, Response}, State) ->
     {Extensions, Actions} = nh_extensions:attach(Response, maps:get(extensions, State)),
     notify(State, {extensions_attached, nh_extensions:attached(Extensions)}),
@@ -870,7 +872,8 @@ update_decision({reschedule, DelayMinutes, Reason}, State) ->
 %% Should this one fail, it sets its own, and holds its own firmware.
 start_update(Payload, State0) ->
     State1 = maps:remove(held, cancel_timer(rejoin, State0)),
-    State = status_update(<<"received">>, #{}, State1#{updating => firmware_id(Payload)}),
+    State2 = downloading(offer_uuid(Payload), State1),
+    State = status_update(<<"received">>, #{}, State2#{updating => firmware_id(Payload)}),
     case before_update(State) of
         ok -> download(Payload, State);
         {error, Reason} -> update_failed(Reason, <<"before_update_failed">>, State)
@@ -1067,7 +1070,7 @@ update_stalled(State) ->
 update_failed(Reason, Described, State) ->
     notify(State, {update_failed, Reason}),
     State1 = status_update(<<"failed">>, #{<<"reason">> => Described}, State),
-    State2 = cancel_timer(update_idle, maps:remove(update, State1)),
+    State2 = downloading(undefined, cancel_timer(update_idle, maps:remove(update, State1))),
     Failures = maps:get(failed_updates, State2, 0),
     Delay = update_retry_delay(Failures, State2),
     State3 = set_timer(
@@ -1081,6 +1084,36 @@ update_failed(Reason, Described, State) ->
     %% Lost during the download rather than closed for it, its own reconnect
     %% is waiting; reopen/1 leaves that alone.
     reopen(State3).
+
+%% `resume_update' is an offer the device received before a restart and kept:
+%% NervesHub sent it once, and does not send it again while the update it
+%% started is in flight. The device says so on its first join
+%% (`currently_downloading_uuid'), so the update is not taken as abandoned, and
+%% downloads from it once joined, without waiting for an offer. The signed URL
+%% in it is good for a day.
+resume(#{resume_update := Payload}, State) when is_map(Payload) ->
+    downloading(offer_uuid(Payload), State#{resume => Payload});
+resume(_Config, State) ->
+    State.
+
+start_resumed(#{resume := Payload} = State) ->
+    start_update(Payload, maps:remove(resume, State));
+start_resumed(State) ->
+    State.
+
+%% While an update is in flight, every join says which firmware it is for: a
+%% join without it -- a socket closed for the download and opened again, a
+%% reconnect -- tells NervesHub the device is idle, and it ends the update as
+%% abandoned. Kept once armed, until the reboot onto the new firmware.
+downloading(undefined, State) ->
+    refresh_join_params(maps:remove(downloading, State));
+downloading(Uuid, State) ->
+    refresh_join_params(State#{downloading => Uuid}).
+
+offer_uuid(#{<<"firmware_meta">> := #{<<"uuid">> := Uuid}}) when is_binary(Uuid) ->
+    Uuid;
+offer_uuid(_Payload) ->
+    undefined.
 
 %% The firmware an offer is for: its UUID, or failing that its URL without the
 %% query, which for a presigned URL changes with every offer.
@@ -1690,7 +1723,7 @@ join_params(#{config := Config} = State) ->
     Reverted = nh_ota:reverted(ota_opts(State)),
 
     maybe_request_keys(
-        Firmware#{
+        (maybe_downloading(State, Firmware))#{
             <<"device_api_version">> => ?DEVICE_API_VERSION,
             <<"meta">> => #{
                 <<"firmware_validated">> => Validated,
@@ -1700,9 +1733,17 @@ join_params(#{config := Config} = State) ->
         Config
     ).
 
+maybe_downloading(#{downloading := Uuid}, Params) ->
+    Params#{<<"currently_downloading_uuid">> => Uuid};
+maybe_downloading(_State, Params) ->
+    Params.
+
+%% Before the channel exists (`init/2' builds it from `join_params/1'), there
+%% is nothing to refresh.
+refresh_join_params(#{channel := Channel} = State) ->
+    State#{channel => nh_channel:set_params(<<"device">>, join_params(State), Channel)};
 refresh_join_params(State) ->
-    Channel = nh_channel:set_params(<<"device">>, join_params(State), maps:get(channel, State)),
-    State#{channel => Channel}.
+    State.
 
 %% Asking is opt-in. A device that verifies against keys it was built with does
 %% not need them, and asking would only widen what it accepts.
