@@ -286,6 +286,14 @@ join(Config) ->
     _Interface = wait_for_event(<<"report_network_interface">>, 1000),
     {Agent, JoinRef}.
 
+%% Skips the events before the one tagged `Tag', for as long as `Timeout' each.
+until_event(Tag, Timeout) ->
+    case next_event(Timeout) of
+        no_event -> {no_event, Tag};
+        Event when element(1, Event) =:= Tag -> ok;
+        _Other -> until_event(Tag, Timeout)
+    end.
+
 send_update(Agent, JoinRef, Payload) ->
     Frame = json:encode([JoinRef, null, <<"device">>, <<"update">>, Payload]),
     Agent ! {websocket, fake_handle, {text, iolist_to_binary(Frame)}}.
@@ -315,6 +323,59 @@ an_available_update_is_downloaded_and_failures_reported_test() ->
     ?assertEqual(<<"failed">>, maps:get(<<"status">>, Reported)),
     ?assertEqual(<<"no_flash_access">>, maps:get(<<"reason">>, Reported)),
 
+    nh_agent:stop(Agent).
+
+%% While a download runs, the device's join says which firmware it is for: a
+%% join without it would tell NervesHub the device is idle, and end the update
+%% as abandoned.
+a_join_during_a_download_says_what_it_downloads_test() ->
+    {Agent, JoinRef} = join(#{updater => nh_ota_waiting, reconnect_backoff => {10, 20}}),
+    send_update(Agent, JoinRef, #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"firmware_meta">> => #{<<"uuid">> => <<"f-uuid">>},
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    }),
+    ok = until_event(update_started, 1000),
+    drain_sent(),
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [_, _, <<"device">>, <<"phx_join">>, Join] = json:decode(next_sent(1000)),
+    ?assertEqual(<<"f-uuid">>, maps:get(<<"currently_downloading_uuid">>, Join)),
+    nh_agent:stop(Agent).
+
+%% An offer kept from before a restart: the first join says the device is
+%% downloading it, and the download starts once joined, without an offer.
+a_kept_offer_is_declared_and_downloaded_after_the_join_test() ->
+    setup(),
+    Offer = #{
+        <<"update_available">> => true,
+        <<"firmware_url">> => <<"http://example.com/fw.avm">>,
+        <<"firmware_meta">> => #{<<"uuid">> => <<"kept-uuid">>},
+        <<"size">> => 1024,
+        <<"checksum">> => <<"abc">>
+    },
+    {ok, Agent} = nh_agent:start(config(#{resume_update => Offer, updater => nh_ota_waiting})),
+    _ = next_opened(),
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef, Ref, <<"device">>, <<"phx_join">>, Join] = json:decode(next_sent(1000)),
+    ?assertEqual(<<"kept-uuid">>, maps:get(<<"currently_downloading_uuid">>, Join)),
+    ?assertEqual(no_event, next_event(100)),
+    Reply = json:encode([
+        JoinRef,
+        Ref,
+        <<"device">>,
+        <<"phx_reply">>,
+        #{<<"status">> => <<"ok">>, <<"response">> => #{}}
+    ]),
+    Agent ! {websocket, fake_handle, {text, iolist_to_binary(Reply)}},
+    ?assertMatch({joined, _}, next_event(1000)),
+    ok = until_event(update_started, 1000),
+    Received = wait_for_event(<<"status_update">>, 1000),
+    ?assertEqual(<<"received">>, maps:get(<<"status">>, Received)),
     nh_agent:stop(Agent).
 
 %% A resume is a sign of life: the download reconnected and asked for the

@@ -7,6 +7,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `resume_update => Payload` starts the download of an offer the device kept
+  from before a restart, once joined, and says so on the first join. NervesHub
+  does not offer an update again while it is in flight, so a device that
+  restarts to download (with only the agent running, say) needs the offer it
+  already had.
 - The `error_reports` extension (0.1.0): with `extensions => [error_reports]`,
   each crash report `proc_lib` logs goes to NervesHub as a structured report
   (kind, reason, frames, and free heap in `context`), grouped by the platform
@@ -148,6 +153,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- While an update is in flight, every join carries
+  `currently_downloading_uuid`. Without it, the join after a socket closed for
+  the download (`keep_open_above`) told NervesHub the device was idle, and it
+  ended the update as abandoned.
 - A send the transport refused with anything but `{error, _}` crashed the
   agent, and its owner with it: atomvm_websocket_client's port, before
   nerves-hub/atomvm_websocket_client#3, answered a bare `not_connected` when
