@@ -88,6 +88,13 @@
 %% `{update_decision_ignored, armed}', and `request_update/1' is answered
 %% `{error, armed}'.
 %%
+%% For as long as NervesHub counts an update as inflight -- from the offer being
+%% taken until NervesHub has heard it failed, or until the reboot onto one that
+%% was written and armed -- every join carries `currently_downloading_uuid', the
+%% offer's `firmware_meta' UUID. A join without it, on the socket opening again
+%% after a download or on any reconnect, would have NervesHub end the update as
+%% abandoned.
+%%
 %% == Error reports ==
 %%
 %% With the `error_reports' extension enabled, a crash `nh_logger' sees, and a
@@ -684,7 +691,12 @@ armed_or_trial(State) ->
         {Marker, {ok, Slot}} when is_pid(Marker) ->
             %% The owner may be new too, and not know a reboot is waiting.
             notify(State, {update_ready, Slot}),
-            State#{trial => none, armed => Slot};
+            %% Set before the channel is, which takes it from join_params/1.
+            Armed = State#{trial => none, armed => Slot},
+            case armed_uuid(Marker) of
+                undefined -> Armed;
+                Uuid -> Armed#{downloading => Uuid}
+            end;
         {Marker, none} when is_pid(Marker) ->
             %% Committed or reverted since: the marker is stale.
             forget_armed(),
@@ -696,13 +708,12 @@ armed_or_trial(State) ->
 %% A registered process that only waits: there while the VM runs, gone with a
 %% reboot. AtomVM has no `persistent_term', and anything kept in NVS or RTC
 %% memory would survive the reboot it is meant to notice.
-remember_armed() ->
+%%
+%% It keeps the UUID of the firmware armed, for an agent started again before
+%% the reboot: its joins still have to say so (set_downloading/2).
+remember_armed(Uuid) ->
     forget_armed(),
-    Marker = spawn(fun() ->
-        receive
-            stop -> ok
-        end
-    end),
+    Marker = spawn(fun() -> armed_marker(Uuid) end),
     try register(?ARMED_MARKER, Marker) of
         true -> ok
     catch
@@ -710,6 +721,31 @@ remember_armed() ->
         error:badarg -> Marker ! stop
     end,
     ok.
+
+armed_marker(Uuid) ->
+    receive
+        stop ->
+            ok;
+        {uuid, From, Ref} ->
+            From ! {Ref, Uuid},
+            armed_marker(Uuid)
+    end.
+
+%% `undefined' from a marker that does not answer, which only costs the join
+%% the UUID.
+armed_uuid(Marker) ->
+    Ref = erlang:monitor(process, Marker),
+    Marker ! {uuid, self(), Ref},
+    receive
+        {Ref, Uuid} ->
+            erlang:demonitor(Ref, [flush]),
+            Uuid;
+        {'DOWN', Ref, process, _Object, _Reason} ->
+            undefined
+    after 1000 ->
+        erlang:demonitor(Ref, [flush]),
+        undefined
+    end.
 
 forget_armed() ->
     case whereis(?ARMED_MARKER) of
@@ -870,7 +906,8 @@ update_decision({reschedule, DelayMinutes, Reason}, State) ->
 %% Should this one fail, it sets its own, and holds its own firmware.
 start_update(Payload, State0) ->
     State1 = maps:remove(held, cancel_timer(rejoin, State0)),
-    State = status_update(<<"received">>, #{}, State1#{updating => firmware_id(Payload)}),
+    State2 = set_downloading(offer_uuid(Payload), State1#{updating => firmware_id(Payload)}),
+    State = status_update(<<"received">>, #{}, State2),
     case before_update(State) of
         ok -> download(Payload, State);
         {error, Reason} -> update_failed(Reason, <<"before_update_failed">>, State)
@@ -1032,7 +1069,9 @@ updater({ok, Slot}, State) ->
     %% call: it may have work to finish first, and a library that restarts a
     %% device on its own is a library that surprises someone.
     notify(State, {update_ready, Slot}),
-    ok = remember_armed(),
+    %% Still downloading as far as NervesHub knows, until the reboot: see
+    %% set_downloading/2.
+    ok = remember_armed(maps:get(downloading, State, undefined)),
     %% Two `maps:remove/2' rather than `maps:without/2', which AtomVM lacks.
     State1 = status_update(
         <<"completed">>,
@@ -1066,8 +1105,10 @@ update_stalled(State) ->
 %% is out of reach for as long as an hour.
 update_failed(Reason, Described, State) ->
     notify(State, {update_failed, Reason}),
-    State1 = status_update(<<"failed">>, #{<<"reason">> => Described}, State),
-    State2 = cancel_timer(update_idle, maps:remove(update, State1)),
+    %% The download is let go first, so that the failure, once NervesHub has
+    %% heard it, takes `currently_downloading_uuid' out of the join (reported/2).
+    State1 = cancel_timer(update_idle, maps:remove(update, State)),
+    State2 = status_update(<<"failed">>, #{<<"reason">> => Described}, State1),
     Failures = maps:get(failed_updates, State2, 0),
     Delay = update_retry_delay(Failures, State2),
     State3 = set_timer(
@@ -1081,6 +1122,45 @@ update_failed(Reason, Described, State) ->
     %% Lost during the download rather than closed for it, its own reconnect
     %% is waiting; reopen/1 leaves that alone.
     reopen(State3).
+
+%% NervesHub writes down an update before it sends the offer, and ends it as
+%% abandoned when the device joins without `currently_downloading_uuid'. So
+%% every join says which firmware the device is getting, for as long as
+%% NervesHub would count the update as inflight: from the offer being taken until
+%% NervesHub has heard it failed (reported/2), or, for one written and armed,
+%% until the reboot onto it, when the device joins running the new firmware and
+%% that is the update's success. A join without it would end the update as
+%% abandoned, then the statuses after it would start a new one with no firmware:
+%% the join after a socket closed for the download, the reopen after a written
+%% update, any reconnect.
+%%
+%% The UUID is `firmware_meta''s, the one nerves_hub_link and
+%% nerves-hub-link-esp32 send. An offer without one leaves the join as it was.
+%% The join is only built again when the UUID changes: building it reads NVS.
+set_downloading(Uuid, State) ->
+    case maps:get(downloading, State, undefined) of
+        Uuid -> State;
+        _Was -> refresh_join_params(downloading(Uuid, State))
+    end.
+
+downloading(undefined, State) -> maps:remove(downloading, State);
+downloading(Uuid, State) -> State#{downloading => Uuid}.
+
+offer_uuid(#{<<"firmware_meta">> := #{<<"uuid">> := Uuid}}) when is_binary(Uuid), Uuid =/= <<>> ->
+    Uuid;
+offer_uuid(_Payload) ->
+    undefined.
+
+%% Called for each status NervesHub is sent. Once it has heard the update failed
+%% it has ended the update itself, and the next join is a device with nothing
+%% inflight. Until then a socket closed for the download keeps saying it is
+%% downloading: its first join comes before the failure it reports, and without
+%% the UUID NervesHub would end the update as abandoned as well as failed. A
+%% download already running again by then is a new update, and keeps its own.
+reported(#{<<"status">> := <<"failed">>}, State) when not is_map_key(update, State) ->
+    set_downloading(undefined, State);
+reported(_Payload, State) ->
+    State.
 
 %% The firmware an offer is for: its UUID, or failing that its URL without the
 %% query, which for a presigned URL changes with every offer.
@@ -1110,7 +1190,7 @@ status_update(Status, Extra, State) ->
         maps:get(handle, State) =/= undefined andalso nh_channel:joined(maps:get(channel, State))
     of
         true ->
-            push_event(<<"status_update">>, Payload, State);
+            reported(Payload, push_event(<<"status_update">>, Payload, State));
         %% The latest of each: a download that resumes says `started' again
         %% each time, and NervesHub needs only where it got to.
         false ->
@@ -1127,7 +1207,7 @@ send_deferred(#{deferred := []} = State) ->
     State;
 send_deferred(#{deferred := Deferred} = State) ->
     lists:foldl(
-        fun(Payload, Acc) -> push_event(<<"status_update">>, Payload, Acc) end,
+        fun(Payload, Acc) -> reported(Payload, push_event(<<"status_update">>, Payload, Acc)) end,
         State#{deferred => []},
         Deferred
     ).
@@ -1678,8 +1758,9 @@ network_interface(#{config := Config}) ->
     end.
 
 %% What the device reports about itself on every join: its firmware, which
-%% protocol version it speaks, whether that firmware has proved itself, and
-%% whether it is running because another did not.
+%% protocol version it speaks, whether that firmware has proved itself, whether
+%% it is running because another did not, and the firmware it is updating to,
+%% while it is (set_downloading/2).
 join_params(#{config := Config} = State) ->
     Firmware =
         case maps:get(metadata, Config, undefined) of
@@ -1690,15 +1771,25 @@ join_params(#{config := Config} = State) ->
     Reverted = nh_ota:reverted(ota_opts(State)),
 
     maybe_request_keys(
-        Firmware#{
-            <<"device_api_version">> => ?DEVICE_API_VERSION,
-            <<"meta">> => #{
-                <<"firmware_validated">> => Validated,
-                <<"firmware_auto_revert_detected">> => Reverted
-            }
-        },
+        maybe_downloading(
+            Firmware#{
+                <<"device_api_version">> => ?DEVICE_API_VERSION,
+                <<"meta">> => #{
+                    <<"firmware_validated">> => Validated,
+                    <<"firmware_auto_revert_detected">> => Reverted
+                }
+            },
+            State
+        ),
         Config
     ).
+
+%% Left out when idle, as nerves-hub-link-esp32 does; NervesHub reads a missing
+%% key and an empty one alike.
+maybe_downloading(Params, #{downloading := Uuid}) ->
+    Params#{<<"currently_downloading_uuid">> => Uuid};
+maybe_downloading(Params, _State) ->
+    Params.
 
 refresh_join_params(State) ->
     Channel = nh_channel:set_params(<<"device">>, join_params(State), maps:get(channel, State)),

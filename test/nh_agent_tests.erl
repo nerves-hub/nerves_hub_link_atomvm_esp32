@@ -827,6 +827,124 @@ a_marker_with_nothing_pending_is_dropped_test() ->
     nh_agent:stop(Agent),
     nh_ota_fake_esp:stop().
 
+%% NervesHub ends an update as abandoned when the device joins without
+%% `currently_downloading_uuid'. A device with nothing inflight leaves it out.
+an_idle_join_names_no_download_test() ->
+    setup(),
+    {ok, Agent} = nh_agent:start(config(#{})),
+    _ = next_opened(),
+    {_JoinRef, _Ref, Params} = next_join(Agent),
+    ?assertNot(is_map_key(<<"currently_downloading_uuid">>, Params)),
+
+    nh_agent:stop(Agent).
+
+%% The download runs on its own connection, so it carries on through a lost
+%% socket; the join on reconnecting says which firmware it is getting.
+a_join_during_a_download_names_its_firmware_test() ->
+    {Agent, JoinRef} = join(#{updater => nh_ota_waiting, reconnect_backoff => {10, 20}}),
+    send_update(Agent, JoinRef, update(<<"fw-uuid">>)),
+    wait_for_notice({update_started, '_'}, 1000),
+
+    Agent ! {websocket, fake_handle, {closed, disconnected}},
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    drain_sent(),
+    {_JoinRef2, _Ref2, Params} = next_join(Agent),
+    ?assertEqual(<<"fw-uuid">>, maps:get(<<"currently_downloading_uuid">>, Params)),
+
+    nh_agent:stop(Agent).
+
+%% Written and armed is still inflight to NervesHub until the device joins
+%% running it. The socket closed for the download opens again before the reboot,
+%% and that join names the firmware too.
+a_join_while_armed_names_the_firmware_test() ->
+    {Agent, JoinRef} = join(#{keep_open_above => never, updater => nh_ota_resumed}),
+    send_update(Agent, JoinRef, update(<<"fw-uuid">>)),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    drain_sent(),
+    {_JoinRef2, _Ref2, Params} = next_join(Agent),
+    ?assertEqual(<<"fw-uuid">>, maps:get(<<"currently_downloading_uuid">>, Params)),
+
+    nh_agent:stop(Agent).
+
+%% An agent started again before the reboot finds the update armed, and its
+%% joins name that firmware as the first agent's did.
+an_agent_started_again_while_armed_names_the_firmware_test() ->
+    ok = nh_ota_fake_esp:start(),
+    Config = #{esp => nh_ota_fake_esp, updater => nh_ota_armed},
+    {Agent, JoinRef} = join(Config),
+    send_update(Agent, JoinRef, update(<<"fw-uuid">>)),
+    wait_for_notice({update_ready, <<"alt.avm">>}, 2000),
+    nh_agent:stop(Agent),
+    flush_events(),
+    drain_sent(),
+
+    {ok, Agent2} = nh_agent:start(config(Config)),
+    _ = next_opened(),
+    {_JoinRef2, _Ref2, Params} = next_join(Agent2),
+    ?assertEqual(<<"fw-uuid">>, maps:get(<<"currently_downloading_uuid">>, Params)),
+
+    nh_agent:stop(Agent2),
+    nh_ota_fake_esp:stop().
+
+%% With the socket open, NervesHub hears the failure at once, and the join the
+%% device makes to be offered an update again is a device with nothing inflight.
+a_rejoin_after_a_failure_names_no_download_test() ->
+    {Agent, JoinRef} = join(#{
+        updater => nh_ota_progress_failed, update_retry_backoff => {200, 200}
+    }),
+    send_update(Agent, JoinRef, update(<<"fw-uuid">>)),
+    wait_for_notice({update_failed, '_'}, 1000),
+    ?assert(lists:member(<<"failed">>, statuses())),
+
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    {_JoinRef2, _Ref2, Params} = next_join(Agent),
+    ?assertNot(is_map_key(<<"currently_downloading_uuid">>, Params)),
+
+    nh_agent:stop(Agent).
+
+%% Closed for the download, the socket's first join comes before the failure it
+%% has to report, and still names the firmware: without it NervesHub would end
+%% the update as abandoned, then hear it failed. Once the failure has gone, the
+%% join after the backoff names nothing.
+a_failure_while_closed_is_named_until_it_is_reported_test() ->
+    {Agent, JoinRef} = join(#{
+        keep_open_above => never,
+        updater => nh_ota_progress_failed,
+        update_retry_backoff => {300, 300}
+    }),
+    send_update(Agent, JoinRef, update(<<"fw-uuid">>)),
+    ?assertEqual(closed, next_closed()),
+    wait_for_notice({update_failed, '_'}, 1000),
+    _ = next_opened(),
+    drain_sent(),
+
+    {JoinRef2, Ref2, Params} = next_join(Agent),
+    ?assertEqual(<<"fw-uuid">>, maps:get(<<"currently_downloading_uuid">>, Params)),
+    ok = reply(Agent, JoinRef2, Ref2, <<"device">>),
+    ?assertEqual(<<"failed">>, maps:get(<<"status">>, wait_for_event(<<"status_update">>, 1000))),
+
+    ?assertEqual(closed, next_closed()),
+    _ = next_opened(),
+    drain_sent(),
+    {_JoinRef3, _Ref3, Rejoin} = next_join(Agent),
+    ?assertNot(is_map_key(<<"currently_downloading_uuid">>, Rejoin)),
+
+    nh_agent:stop(Agent).
+
+update(Uuid) ->
+    (update())#{<<"firmware_meta">> => #{<<"uuid">> => Uuid}}.
+
+%% Brings the socket up and returns the device topic's join.
+next_join(Agent) ->
+    Agent ! {websocket, fake_handle, connected},
+    [JoinRef, Ref, <<"device">>, <<"phx_join">>, Params] = json:decode(next_sent(1000)),
+    {JoinRef, Ref, Params}.
+
 %% The agent does not give up on a download sooner than the download's own
 %% resumes allow: quiet for 400 ms is within two resumes of 200 ms each.
 the_agent_waits_out_the_downloads_own_resumes_test() ->

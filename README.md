@@ -281,6 +281,17 @@ committing it on the first join), and the owner hears `{update_ready, Slot}`
 again. That takes a small registered process, `nh_armed`, which waits from the
 arming until the reboot ends it.
 
+NervesHub keeps a record of each update it sends, and ends it as `abandoned`
+when the device joins without `currently_downloading_uuid`. So for as long as
+NervesHub counts the update as inflight, every join carries the UUID of the
+firmware being installed (the offer's `firmware_meta` UUID, as nerves_hub_link
+sends): from the offer being taken until NervesHub has heard the update failed,
+or, for one written and armed, until the device joins running it. That covers
+the socket opening again after a download, a reconnect while the download runs
+on its own connection, and an agent started again before the reboot (`nh_armed`
+keeps the UUID). A socket closed for a download that failed still sends it on
+its first join, which comes before the failure it reports.
+
 A connection that goes quiet for `resume_after_ms` (10 s), fails or closes
 short is dropped, and the rest is asked for from the last byte received with a
 `Range` request. The download gives up only after `resumes` (3) connections in
@@ -609,6 +620,7 @@ healthy and silently stops receiving updates.
 | `device_api_version` | `2.4.0`, the NervesHub protocol it speaks |
 | `meta.firmware_validated` | `false` while the firmware is [on trial](#on-trial) |
 | `meta.firmware_auto_revert_detected` | `true` after a revert, until the next update proves itself |
+| `currently_downloading_uuid` | the offer's `firmware_meta` UUID while an update is [inflight](#updates); left out otherwise |
 
 After joining it also reports `report_network_interface`, from
 `network_interface`. A function there is asked on each join and as a download

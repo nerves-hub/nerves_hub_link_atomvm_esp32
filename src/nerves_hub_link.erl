@@ -209,6 +209,11 @@
 %% socket stays open. See `nh_agent'. `before_update => Fun' runs first, to
 %% free memory for the download (the application's own TLS connections, say).
 %%
+%% From the offer being taken until NervesHub has heard the update failed, or
+%% until the reboot onto one written and armed, every join says which firmware
+%% the device is installing (`currently_downloading_uuid'), so that a reconnect
+%% in between does not have NervesHub end the update as abandoned.
+%%
 %% == Firmware description ==
 %%
 %% `firmware' says where the running firmware's description comes from:

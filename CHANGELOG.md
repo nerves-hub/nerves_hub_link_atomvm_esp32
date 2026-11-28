@@ -148,6 +148,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Every join sends `currently_downloading_uuid` while NervesHub counts an
+  update as inflight: from the offer being taken until NervesHub has heard it
+  failed, or until the reboot onto one written and armed. Without it NervesHub
+  ended the update as `abandoned` on any join in between (the socket opening
+  again after the download, a reconnect, an agent started again before the
+  reboot), and the statuses after it started an update with no firmware, which
+  kept the device from being offered another.
 - A send the transport refused with anything but `{error, _}` crashed the
   agent, and its owner with it: atomvm_websocket_client's port, before
   nerves-hub/atomvm_websocket_client#3, answered a bare `not_connected` when
